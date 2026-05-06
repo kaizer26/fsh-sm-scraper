@@ -1,0 +1,7 @@
+requests
+pandas
+openpyxl
+tqdm
+selenium
+undetected-chromedriver
+urllib3
