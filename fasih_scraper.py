@@ -291,15 +291,25 @@ def suntik_cookies_ke_driver(driver, jar, ls=None, ss=None):
 def main_login(driver, user, pwd=None):
     if not pwd: pwd = input("Masukkan password SSO: ")
     
-    # Bersihkan sesi lama
+    # 1. Bersihkan sesi lama
     try:
         driver.get(BASE_URL + "/")
         time.sleep(2); driver.delete_all_cookies()
         driver.execute_script("window.localStorage.clear(); window.sessionStorage.clear(); if(window.indexedDB){indexedDB.databases().then(dbs=>dbs.forEach(db=>indexedDB.deleteDatabase(db.name)))}")
+        driver.refresh()
     except: pass
 
-    # Arahkan ke pintu masuk login FASIH (otomatis dialihkan ke SSO dengan redirect_uri yang benar)
-    driver.get(f"{BASE_URL}/oauth2/authorization/ics")
+    # 2. Buka FASIH dan klik tombol Login
+    print("🌐 Membuka halaman FASIH dan menekan tombol login...")
+    try:
+        wait = WebDriverWait(driver, 15)
+        btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="login-in"]/a[2]')))
+        driver.execute_script("arguments[0].click();", btn)
+        # Tunggu sampai browser dialihkan ke halaman SSO BPS
+        WebDriverWait(driver, 10).until(lambda d: "sso.bps.go.id" in d.current_url)
+    except:
+        # Fallback jika gagal klik tombol
+        driver.get(f"{BASE_URL}/oauth2/authorization/ics")
     
     try:
         wait = WebDriverWait(driver, 10)
