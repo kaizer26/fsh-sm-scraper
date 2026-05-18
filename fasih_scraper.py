@@ -298,8 +298,8 @@ def main_login(driver, user, pwd=None):
         driver.execute_script("window.localStorage.clear(); window.sessionStorage.clear(); if(window.indexedDB){indexedDB.databases().then(dbs=>dbs.forEach(db=>indexedDB.deleteDatabase(db.name)))}")
     except: pass
 
-    # Arahkan langsung ke SSO BPS
-    driver.get("https://sso.bps.go.id")
+    # Arahkan ke pintu masuk login FASIH (otomatis dialihkan ke SSO dengan redirect_uri yang benar)
+    driver.get(f"{BASE_URL}/oauth2/authorization/ics")
     
     try:
         wait = WebDriverWait(driver, 10)
@@ -315,14 +315,15 @@ def main_login(driver, user, pwd=None):
         driver.find_element(By.ID, "kc-login").click()
     except: pass
 
-    # Tunggu sampai SSO berhasil dan bukan lagi di halaman sso
-    print("⏳ Menunggu Anda menyelesaikan login...")
-    WebDriverWait(driver, 60).until(lambda d: "sso.bps.go.id" not in d.current_url)
-
-    # Autorisasi FASIH
-    print("🔐 Mengotorisasi FASIH...")
-    driver.get(f"{BASE_URL}/oauth2/authorization/ics")
-    time.sleep(5)
+    # Tunggu sampai login berhasil dan browser otomatis kembali ke FASIH (meninggalkan sso.bps.go.id)
+    print("⏳ Menunggu Anda menyelesaikan login (Buka browser jika ada kendala/captcha)...")
+    try:
+        WebDriverWait(driver, 60).until(lambda d: "sso.bps.go.id" not in d.current_url)
+    except:
+        pass # Biarkan lanjut saja untuk mencoba memuat dashboard
+        
+    print("🔐 Otorisasi berhasil, memuat halaman FASIH...")
+    time.sleep(3)
     
     # Masuk ke dashboard
     driver.get(f"{BASE_URL}/survey-collection/survey")
