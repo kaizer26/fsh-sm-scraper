@@ -290,37 +290,45 @@ def suntik_cookies_ke_driver(driver, jar, ls=None, ss=None):
 
 def main_login(driver, user, pwd=None):
     if not pwd: pwd = input("Masukkan password SSO: ")
-    while True:
-        try:
-            driver.get(BASE_URL + "/")
-            time.sleep(2); driver.delete_all_cookies()
-            driver.execute_script("window.localStorage.clear(); window.sessionStorage.clear(); if(window.indexedDB){indexedDB.databases().then(dbs=>dbs.forEach(db=>indexedDB.deleteDatabase(db.name)))}")
-            driver.refresh(); break
-        except: time.sleep(2)
     
+    # Bersihkan sesi lama
     try:
-        wait = WebDriverWait(driver, 20)
-        btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="login-in"]/a[2]')))
-        driver.execute_script("arguments[0].click();", btn)
-        time.sleep(5)
-        if "oauth_login.html" in driver.current_url: driver.get(BASE_URL + "/oauth_login")
+        driver.get(BASE_URL + "/")
+        time.sleep(2); driver.delete_all_cookies()
+        driver.execute_script("window.localStorage.clear(); window.sessionStorage.clear(); if(window.indexedDB){indexedDB.databases().then(dbs=>dbs.forEach(db=>indexedDB.deleteDatabase(db.name)))}")
     except: pass
 
+    # Arahkan langsung ke SSO BPS
+    driver.get("https://sso.bps.go.id")
+    
     try:
-        wait = WebDriverWait(driver, 15)
+        wait = WebDriverWait(driver, 10)
         wait.until(EC.presence_of_element_located((By.NAME, "username"))).send_keys(user)
         driver.find_element(By.NAME, "password").send_keys(pwd)
         driver.find_element(By.ID, "kc-login").click()
     except: pass
 
     try:
-        otp_field = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.ID, "otp")))
-        otp = input("Masukkan OTP: ").strip()
+        otp_field = WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.ID, "otp")))
+        otp = input("Masukkan OTP SSO Anda: ").strip()
         otp_field.send_keys(otp)
         driver.find_element(By.ID, "kc-login").click()
     except: pass
 
-    WebDriverWait(driver, 45).until(lambda d: "fasih-sm.bps.go.id" in d.current_url and "oauth_login.html" not in d.current_url)
+    # Tunggu sampai SSO berhasil dan bukan lagi di halaman sso
+    print("⏳ Menunggu Anda menyelesaikan login...")
+    WebDriverWait(driver, 60).until(lambda d: "sso.bps.go.id" not in d.current_url)
+
+    # Autorisasi FASIH
+    print("🔐 Mengotorisasi FASIH...")
+    driver.get(f"{BASE_URL}/oauth2/authorization/ics")
+    time.sleep(5)
+    
+    # Masuk ke dashboard
+    driver.get(f"{BASE_URL}/survey-collection/survey")
+    WebDriverWait(driver, 15).until(lambda d: "survey-collection" in d.current_url)
+    
+    print("✅ Berhasil masuk ke dashboard FASIH!")
     return ambil_cookies_dan_buat_session(driver, pwd)
 
 # ====================================================================
@@ -522,11 +530,23 @@ def process_assignments_generic(sid, tid, pid, kn, sn, alist, head, jar, sess, d
 
 def timestamp(): return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def main1(head, jar, sess, drv):
+def main1(user, pwd, head, jar, sess, drv):
     global MAX_WORKERS_WILAYAH
     clear_screen()
+    
+    print("\n⚠️ Silakan periksa terlebih dahulu status login pada browser (driver).")
+    print("   Jika belum berhasil login, silakan login manual terlebih dahulu sebelum lanjut.")
     t = input(f"Thread (default {MAX_WORKERS_WILAYAH}): ").strip()
     if t: MAX_WORKERS_WILAYAH = int(t)
+    
+    # Lakukan simpan session dari browser (mengambil cookies terbaru jika user baru login manual)
+    try:
+        new_head, new_jar, new_sess, _, new_ls, new_ss = ambil_cookies_dan_buat_session(drv, pwd)
+        simpan_session(user, new_head, new_jar, new_sess, pwd, new_ls, new_ss)
+        head, jar, sess = new_head, new_jar, new_sess
+        print("✅ Session berhasil diperbarui dan disimpan.")
+    except Exception as e:
+        print(f"⚠️ Gagal menyimpan session baru: {e}")
     
     print("\n=== Pilih Tipe Survey ===")
     print("1. Pencacahan")
@@ -697,7 +717,7 @@ if __name__ == "__main__":
 
     while True:
         try:
-            main1(h, c, s, drv)
+            main1(user, p, h, c, s, drv)
             if input("Keluar script? (y/n): ").lower() == 'y': break
         except Exception as e: print(f"❌ Error: {e}"); time.sleep(5)
     print("👋 Closing...")
