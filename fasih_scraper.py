@@ -147,7 +147,7 @@ def muat_session(user):
                     # Jika session > 1 jam (3600 detik), anggap expired
                     if time.time() - d.get('time', 0) > 3600:
                         print("⏳ Session sudah lebih dari 1 jam. Perlu login ulang.")
-                        return None, None, None, None, None, None
+                        return None, None, None, _deobf(d['pwd']), None, None
                     return d['head'], d['cook'], create_resilient_session(d['cook'], d['head']), _deobf(d['pwd']), d.get('ls'), d.get('ss')
         except:
             pass
@@ -360,33 +360,74 @@ def _get_lvl(lvl, pid, gid, head, sess):
     except: return []
 
 def ambil_semua_sls_parallel(kid, lvls, gid, head, jar, r1, r2):
-    print(f"🚀 Memulai pengambilan data wilayah untuk {r2['name']}...")
+    hierarki = " => ".join([name.get('name', '') for name in lvls])
+    print(f"\n🚀 [Parallel] Mengambil data wilayah hierarki ({hierarki}) untuk {r2['name']}...")
+
+    if not isinstance(lvls, list) or len(lvls) < 3:
+        if len(lvls) == 2: return pd.DataFrame([r2])
+        if len(lvls) == 1: return pd.DataFrame([r1])
+        return pd.DataFrame()
+        
+    r1_id = r1['id']
+    r2_id = r2['id']
+
     kecs = _get_lvl(3, kid, gid, head, create_resilient_session(jar))
-    
+    if not kecs:
+        print("❌ Tidak ada kecamatan ditemukan.")
+        return pd.DataFrame()
+
     all_desa = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
         fs = {ex.submit(_get_lvl, 4, k['id'], gid, head, create_resilient_session(jar)): k for k in kecs}
         for f in tqdm(as_completed(fs), total=len(fs), desc="📂 Mengambil Desa per Kec", unit="kec"):
             for d in f.result(): 
                 d['pkid'] = fs[f]['id']; d['pkn'] = fs[f]['name']; all_desa.append(d)
-                
+
+    if len(lvls) == 3: # Hanya sampai Kecamatan
+        return pd.DataFrame([{
+            'region1Id': r1_id, 'region2Id': r2_id, 'region3Id': k['id'],
+            f'{lvls[2]["name"]}': k['name'], 'smallcode': k['fullCode']
+        } for k in kecs])
+
     all_sls = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
         fs = {ex.submit(_get_lvl, 5, d['id'], gid, head, create_resilient_session(jar)): d for d in all_desa}
         for f in tqdm(as_completed(fs), total=len(fs), desc="🏠 Mengambil SLS per Desa", unit="desa"):
             for s in f.result(): 
-                s.update({'pdid': fs[f]['id'], 'pdn': fs[f]['name'], 'pkid': fs[f]['pkid'], 'pkn': fs[f]['pkn']}); all_sls.append(s)
-                
-    if len(lvls) >= 6:
+                s.update({'pdid': fs[f]['id'], 'pdn': fs[f]['name'], 'pkid': fs[f]['pkid'], 'pkn': fs[f]['pkn']})
+                all_sls.append(s)
+
+    if len(lvls) == 4: # Hanya sampai Desa
+        return pd.DataFrame([{
+            'region1Id': r1_id, 'region2Id': r2_id, 'region3Id': d['pkid'],
+            'region4Id': d['id'], f'{lvls[2]["name"]}': d['pkn'],
+            f'{lvls[3]["name"]}': d['name'], 'smallcode': d['fullCode']
+        } for d in all_desa])
+
+    if len(lvls) >= 6: # Sub-SLS (Level 6)
         results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
             fs = {ex.submit(_get_lvl, 6, s['id'], gid, head, create_resilient_session(jar)): s for s in all_sls}
             for f in tqdm(as_completed(fs), total=len(fs), desc="📍 Mengambil Sub-SLS", unit="sls"):
                 for b in f.result(): 
-                    results.append({'region1Id': r1['id'], 'region2Id': r2['id'], 'region3Id': fs[f]['pkid'], 'region4Id': fs[f]['pdid'], 'region5Id': fs[f]['id'], 'region6Id': b['id'], 'Kec': fs[f]['pkn'], 'Desa': fs[f]['pdn'], 'SLS': fs[f]['name'], 'SubSLS': b['name'], 'smallcode': b['fullCode']})
+                    results.append({
+                        'region1Id': r1_id, 'region2Id': r2_id, 'region3Id': fs[f]['pkid'],
+                        'region4Id': fs[f]['pdid'], 'region5Id': fs[f]['id'], 'region6Id': b['id'],
+                        f'{lvls[2]["name"]}': fs[f]['pkn'],
+                        f'{lvls[3]["name"]}': fs[f]['pdn'],
+                        f'{lvls[4]["name"]}': fs[f]['name'],
+                        f'{lvls[5]["name"]}': b['name'],
+                        'smallcode': b['fullCode']
+                    })
         return pd.DataFrame(results)
-        
-    return pd.DataFrame([{'region1Id': r1['id'], 'region2Id': r2['id'], 'region3Id': s['pkid'], 'region4Id': s['pdid'], 'region5Id': s['id'], 'Kec': s['pkn'], 'Desa': s['pdn'], 'SLS': s['name'], 'smallcode': s['fullCode']} for s in all_sls])
+
+    # Fallback to SLS (Level 5)
+    return pd.DataFrame([{
+        'region1Id': r1_id, 'region2Id': r2_id, 'region3Id': s['pkid'],
+        'region4Id': s['pdid'], 'region5Id': s['id'], 'region6Id': None,
+        f'{lvls[2]["name"]}': s['pkn'], f'{lvls[3]["name"]}': s['pdn'],
+        f'{lvls[4]["name"]}': s['name'], 'smallcode': s['fullCode']
+    } for s in all_sls])
 
 def flatten_val(val):
     if isinstance(val, list):
@@ -438,21 +479,60 @@ def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_l
     try:
         r = sess.post(url, headers=head, json=payload).json()
         hit = r.get('totalHit', 0)
+        
         if current_level >= max_level or ("admin" in role.lower() and hit <= 1000):
+            if hit == 0: return []
+            
+            # Strategi By User untuk hit > 1000 (batas return API)
+            if current_level >= max_level and hit > 1000 and user_ids:
+                all_collected = []
+                collected_ids = set()
+                
+                def _fetch_user_task(uid):
+                    p = payload.copy()
+                    p['assignmentExtraParam'] = p['assignmentExtraParam'].copy()
+                    p['assignmentExtraParam']['currentUserId'] = uid
+                    p['start'] = 0
+                    p['length'] = 1000
+                    user_results = []
+                    while True:
+                        try:
+                            resp = sess.post(url, headers=head, json=p, timeout=20).json()
+                            data = resp.get('searchData', [])
+                            user_results.extend(data)
+                            if len(data) == 1000:
+                                p['start'] += 1000
+                            else:
+                                break
+                        except: break
+                    return user_results
+                
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
+                    fs = {ex.submit(_fetch_user_task, uid): uid for uid in user_ids}
+                    for f in as_completed(fs):
+                        for item in f.result():
+                            if item['id'] not in collected_ids:
+                                all_collected.append(item)
+                                collected_ids.add(item['id'])
+                return all_collected
+
+            # Jika tidak lebih dari 1000 atau user_ids kosong, tarik langsung
             res = []
             for s in range(0, hit, 1000):
                 payload.update({"start": s, "length": 1000})
                 res.extend(sess.post(url, headers=head, json=payload).json().get('searchData', []))
             return res
+            
         sub = _get_lvl(current_level + 1, filt.get(f'region{current_level}Id'), gid, head, sess)
         all_r = []
         for c in sub:
             nf = filt.copy(); nf[f'region{current_level+1}Id'] = c['id']; nf['smallcode'] = c.get('fullCode')
-            # Tambahkan print sederhana agar user tahu proses masih jalan
             if current_level <= 3: print(f"   📂 Mencari di: {c['name']}...")
             all_r.extend(fetch_assignments_dynamic(sess, head, pid, gid, nf, current_level + 1, max_level, role, id_survey, user_ids))
         return all_r
-    except: return []
+    except Exception as e:
+        print(f"⚠️ Error fetch assignments: {e}")
+        return []
 
 def approve_condition(r, s, e):
     r_lower, s_lower = str(r).lower(), str(s).lower()
@@ -546,18 +626,63 @@ def main1(user, pwd, head, jar, sess, drv):
     clear_screen()
     
     print("\n⚠️ Silakan periksa terlebih dahulu status login pada browser (driver).")
-    print("   Jika belum berhasil login, silakan login manual terlebih dahulu sebelum lanjut.")
-    t = input(f"Thread (default {MAX_WORKERS_WILAYAH}): ").strip()
-    if t: MAX_WORKERS_WILAYAH = int(t)
+    print("   Pastikan Anda sudah berada di Dashboard FASIH sebelum melanjutkan.")
     
-    # Lakukan simpan session dari browser (mengambil cookies terbaru jika user baru login manual)
-    try:
-        new_head, new_jar, new_sess, _, new_ls, new_ss = ambil_cookies_dan_buat_session(drv, pwd)
-        simpan_session(user, new_head, new_jar, new_sess, pwd, new_ls, new_ss)
-        head, jar, sess = new_head, new_jar, new_sess
-        print("✅ Session berhasil diperbarui dan disimpan.")
-    except Exception as e:
-        print(f"⚠️ Gagal menyimpan session baru: {e}")
+    auto_tried = False
+    while True:
+        # Cek apakah session saat ini valid
+        test_ok = False
+        if sess:
+            try:
+                # Gunakan POST sesuai permintaan user
+                r = sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType=Pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
+                if r.status_code == 200 and 'data' in r.json(): test_ok = True
+            except: pass
+
+        if test_ok:
+            print("✅ Session API saat ini masih valid.")
+            break
+
+        current_url = ""
+        try: current_url = drv.current_url
+        except: pass
+
+        if "survey-collection/survey" in current_url and not auto_tried:
+            print("\n🔄 Browser terdeteksi sudah di Dashboard. Mensinkronkan otomatis...")
+            auto_tried = True
+        else:
+            print("\n🔄 Session belum terdeteksi atau tidak valid.")
+            input("👉 Tekan ENTER jika Anda sudah berhasil login dan melihat Dashboard FASIH di browser...")
+            print("🔄 Membaca ulang session dari browser...")
+            
+        try:
+            # Paksa pindah ke domain utama jika belum
+            if "fasih-sm.bps.go.id" not in drv.current_url:
+                drv.get(BASE_URL + "/")
+                time.sleep(3) # Tunggu agar JS sempat memuat token
+                
+            new_head, new_jar, new_sess, _, new_ls, new_ss = ambil_cookies_dan_buat_session(drv, pwd)
+            
+            # Verifikasi apakah session dari browser ini benar-benar bisa menembus backend
+            try:
+                test_r = new_sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType=Pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
+                if test_r.status_code != 200:
+                    raise Exception(f"HTTP Status {test_r.status_code} (Harusnya 200 OK)")
+                if 'data' not in test_r.json():
+                    raise Exception("Response JSON tidak memuat 'data'.")
+            except Exception as e_api:
+                raise Exception(f"Session belum menembus API. Detail: {e_api}")
+                
+            simpan_session(user, new_head, new_jar, new_sess, pwd, new_ls, new_ss)
+            head, jar, sess = new_head, new_jar, new_sess
+            print("✅ Session berhasil diperbarui dari browser.")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            print("   Silakan periksa kembali browser Anda.")
+
+    t = input(f"\nThread (default {MAX_WORKERS_WILAYAH}): ").strip()
+    if t: MAX_WORKERS_WILAYAH = int(t)
     
     print("\n=== Pilih Tipe Survey ===")
     print("1. Pencacahan")
@@ -619,7 +744,7 @@ def main1(user, pwd, head, jar, sess, drv):
     if pilih_filter == 'Y':
         cols = [c for c in df_w.columns if not c.endswith('Id') and c != 'smallcode']
         for i, row in df_w.iterrows():
-            nama_wilayah = " - ".join([str(row[c]) for c in cols if pd.notna(row[row[c] == row[c]])]) # Handle NaN
+            nama_wilayah = " - ".join([str(row[c]) for c in cols if pd.notna(row[c])]) # Handle NaN
             print(f"[{i}] {row['smallcode']} | {nama_wilayah}")
         
         input_pilih = input("\nMasukkan index (contoh: '1,3,5' atau '0-10' atau 'all'): ").strip().lower()
@@ -661,10 +786,13 @@ def main1(user, pwd, head, jar, sess, drv):
                 if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
         else: # Per Wilayah yang difilter
             max_lvl = len(lvls)
+            avail = [int(c.replace('region','').replace('Id','')) for c in df_f.columns if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()]
+            curr_lvl = max(avail) if avail else max_lvl
+            
             def _fetch_row(row):
                 f = {f"region{i}Id": row.get(f'region{i}Id') for i in range(1, 11)}
                 f['smallcode'] = row.get('smallcode')
-                return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=max_lvl-1, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
+                return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=curr_lvl, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
                 fs = {ex.submit(_fetch_row, row): i for i, row in df_f.iterrows()}
@@ -690,13 +818,50 @@ def main1(user, pwd, head, jar, sess, drv):
                         all_ans.append(res['ans'])
             
             print(f"💾 Menyusun file Excel...")
-            with pd.ExcelWriter(out_file) as writer:
-                pd.DataFrame(all_meta).to_excel(writer, sheet_name='Daftar_Tugas', index=False)
-                if all_pref: pd.DataFrame(all_pref).to_excel(writer, sheet_name='Pre-defined', index=False)
-                if all_ans: pd.DataFrame(all_ans).to_excel(writer, sheet_name='Answers', index=False)
+            total_data = len(all_meta)
+            chunk_size = 10000
+            ts = timestamp()
             
-            print(f"✅ Selesai! Data disimpan di: {os.path.relpath(out_file)}")
+            if total_data == 0:
+                print("⚠️ Tidak ada data untuk disimpan.")
+            else:
+                for i in range(0, total_data, chunk_size):
+                    part_num = (i // chunk_size) + 1
+                    part_suffix = f"_Part{part_num}" if total_data > chunk_size else ""
+                    chunk_file = os.path.join(out_dir, f"Scrape_{safe_sn}_{ts}{part_suffix}.xlsx")
+                    
+                    with pd.ExcelWriter(chunk_file) as writer:
+                        pd.DataFrame(all_meta[i:i+chunk_size]).to_excel(writer, sheet_name='Daftar_Tugas', index=False)
+                        if all_pref: pd.DataFrame(all_pref[i:i+chunk_size]).to_excel(writer, sheet_name='Pre-defined', index=False)
+                        if all_ans: pd.DataFrame(all_ans[i:i+chunk_size]).to_excel(writer, sheet_name='Answers', index=False)
+                    
+                    if part_suffix:
+                        print(f"✅ File {part_suffix.replace('_', '')} disimpan: {os.path.relpath(chunk_file)}")
+                    else:
+                        print(f"✅ Selesai! Data disimpan di: {os.path.relpath(chunk_file)}")
         else:
+            tanya_filter = input("\n📝 Apakah Anda ingin memfilter eksekusi menggunakan file Excel? (Y/N, default N): ").strip().upper()
+            if tanya_filter == 'Y':
+                print("Pilih file Excel yang berisi kolom assignment_id (atau memuat kata 'id')...")
+                root = tk.Tk(); root.withdraw()
+                filter_file = filedialog.askopenfilename(title="Pilih File Filter", filetypes=[("Excel files", "*.xlsx *.xls")])
+                if filter_file:
+                    try:
+                        df_filter = pd.read_excel(filter_file)
+                        # Cari kolom yang mirip dengan assignment_id
+                        col_id = next((c for c in df_filter.columns if 'id' in str(c).lower() and 'assignment' in str(c).lower()), None)
+                        if not col_id:
+                            col_id = next((c for c in df_filter.columns if 'id' in str(c).lower()), df_filter.columns[0])
+                            
+                        filter_ids = set(df_filter[col_id].dropna().astype(str))
+                        sebelum = len(unique)
+                        unique = [u for u in unique if str(u.get('id') or u.get('assignmentId')) in filter_ids]
+                        print(f"✅ Berhasil memfilter! Dari {sebelum} data menjadi {len(unique)} data yang akan dieksekusi.")
+                    except Exception as e:
+                        print(f"⚠️ Gagal membaca file filter: {e}. Menggunakan semua data.")
+                else:
+                    print("⚠️ Tidak ada file dipilih. Menggunakan semua data.")
+                    
             if aksi == "2":
                 tanya_bypass = input("\n⚠️ Aktifkan kondisi khusus Admin Kabupaten (Bypass PML)? (Y/N, default N): ").strip().upper()
                 global ADMIN_BYPASS_PML
