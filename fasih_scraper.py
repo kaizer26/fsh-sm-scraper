@@ -456,7 +456,17 @@ def fetch_detail_task(sess, head, d, tid, pid):
             'assignment_id': aid,
             'current_user': res.get('current_user_username', ''),
             'status': res.get('assignment_status_alias', ''),
-            'identity': res.get('code_identity', '')
+            'identity': res.get('code_identity', ''),
+            'data1': res.get('data1', ''),
+            'data2': res.get('data2', ''),
+            'data3': res.get('data3', ''),
+            'data4': res.get('data4', ''),
+            'data5': res.get('data5', ''),
+            'data6': res.get('data6', ''),
+            'data7': res.get('data7', ''),
+            'data8': res.get('data8', ''),
+            'data9': res.get('data9', ''),
+            'data10': res.get('data10', ''),
         }
         
         # Predefined Data
@@ -763,42 +773,76 @@ def main1(user, pwd, head, jar, sess, drv):
     while True:
         clear_screen()
         print(f"📊 Survei: {sn}\n📍 Wilayah: {kn} ({len(df_f)} unit)\n👤 Role: {getRoles(pid, head, sess)}")
-        print("\n=== Menu ===\n1. Scrape\n2. Approve\n3. Revoke\n4. Reject\n5. Ganti Survey")
+        print("\n=== Menu ===\n1. Scrape\n2. Approve\n3. Revoke\n4. Reject\n5. History Email Broadcast\n6. Ganti Survey")
         aksi = input("Pilihan: ").strip()
-        if aksi == "5": break
-        if aksi not in "1234": continue
+        if aksi == "6": break
+        if aksi not in "12345": continue
         
-        rid = sess.get(f"{BASE_URL}/survey/api/v1/survey-roles?surveyId={sid}").json()['data'][-1]['id']
-        uids = [u['userId'] for u in sess.get(f"{BASE_URL}/survey/api/v1/survey-period-role-users/region?surveyPeriodId={pid}&surveyRoleId={rid}&regionCode={sel_k['fullCode']}").json()['data']] + [None]
-        
-        # Sinkronisasi browser
-        print(f"🌐 Sinkronisasi browser...")
-        # drv.get(f"https://fasih-sm.bps.go.id/survey-collection/collect/{sid}")
-        
-        # Pengambilan data (Drill-down vs Per Wilayah)
-        print(f"🔍 Mencari data penugasan...")
-        unique = []
-        seen = set()
-        
-        if len(df_f) == len(df_w): # Ambil semua (Drill-down)
-            ids = fetch_assignments_dynamic(sess, head, pid, gid, {"region1Id": sel_p['id'], "region2Id": sel_k['id']}, max_level=6, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
-            for x in ids:
-                if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
-        else: # Per Wilayah yang difilter
-            max_lvl = len(lvls)
-            avail = [int(c.replace('region','').replace('Id','')) for c in df_f.columns if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()]
-            curr_lvl = max(avail) if avail else max_lvl
+        pilihan_mode = None
+        excel_assignment_ids = []
+        if aksi == "5":
+            print("\n=== Mode History Email Broadcast ===")
+            print("1. Berdasarkan Wilayah Terpilih (Satu/beberapa request per wilayah, sangat cepat)")
+            print("2. Berdasarkan ID Tugas Terpilih (Parallel query per assignment dari hasil scan wilayah)")
+            print("3. Berdasarkan ID Tugas dari File Excel (Parallel query per assignment dari file Excel)")
+            pilihan_mode = input("Pilih mode (1-3, default 1): ").strip()
+            if pilihan_mode not in ["1", "2", "3"]:
+                pilihan_mode = "1"
             
-            def _fetch_row(row):
-                f = {f"region{i}Id": row.get(f'region{i}Id') for i in range(1, 11)}
-                f['smallcode'] = row.get('smallcode')
-                return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=curr_lvl, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
+            if pilihan_mode == "3":
+                print("Pilih file Excel yang berisi kolom assignment_id (atau memuat kata 'id')...")
+                root = tk.Tk(); root.withdraw()
+                filter_file = filedialog.askopenfilename(title="Pilih File Excel Assignment ID", filetypes=[("Excel files", "*.xlsx *.xls")])
+                if filter_file:
+                    try:
+                        df_filter = pd.read_excel(filter_file)
+                        col_id = next((c for c in df_filter.columns if 'id' in str(c).lower() and 'assignment' in str(c).lower()), None)
+                        if not col_id:
+                            col_id = next((c for c in df_filter.columns if 'id' in str(c).lower()), df_filter.columns[0])
+                        
+                        excel_assignment_ids = list(df_filter[col_id].dropna().astype(str).unique())
+                        print(f"✅ Berhasil memuat {len(excel_assignment_ids)} ID Tugas dari Excel.")
+                    except Exception as e:
+                        print(f"❌ Gagal membaca file Excel: {e}")
+                        pilihan_mode = None
+                else:
+                    print("⚠️ Tidak ada file dipilih.")
+                    pilihan_mode = None
+        
+        need_assignments = (aksi in ["1", "2", "3", "4"]) or (aksi == "5" and pilihan_mode == "2")
+        
+        unique = []
+        if need_assignments:
+            rid = sess.get(f"{BASE_URL}/survey/api/v1/survey-roles?surveyId={sid}").json()['data'][-1]['id']
+            uids = [u['userId'] for u in sess.get(f"{BASE_URL}/survey/api/v1/survey-period-role-users/region?surveyPeriodId={pid}&surveyRoleId={rid}&regionCode={sel_k['fullCode']}").json()['data']] + [None]
+            
+            # Sinkronisasi browser
+            print(f"🌐 Sinkronisasi browser...")
+            # drv.get(f"https://fasih-sm.bps.go.id/survey-collection/collect/{sid}")
+            
+            # Pengambilan data (Drill-down vs Per Wilayah)
+            print(f"🔍 Mencari data penugasan...")
+            seen = set()
+            
+            if len(df_f) == len(df_w): # Ambil semua (Drill-down)
+                ids = fetch_assignments_dynamic(sess, head, pid, gid, {"region1Id": sel_p['id'], "region2Id": sel_k['id']}, max_level=6, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
+                for x in ids:
+                    if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+            else: # Per Wilayah yang difilter
+                max_lvl = len(lvls)
+                avail = [int(c.replace('region','').replace('Id','')) for c in df_f.columns if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()]
+                curr_lvl = max(avail) if avail else max_lvl
+                
+                def _fetch_row(row):
+                    f = {f"region{i}Id": row.get(f'region{i}Id') for i in range(1, 11)}
+                    f['smallcode'] = row.get('smallcode')
+                    return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=curr_lvl, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
-                fs = {ex.submit(_fetch_row, row): i for i, row in df_f.iterrows()}
-                for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Data Wilayah"):
-                    for x in f.result():
-                        if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
+                    fs = {ex.submit(_fetch_row, row): i for i, row in df_f.iterrows()}
+                    for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Data Wilayah"):
+                        for x in f.result():
+                            if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
         
         if aksi == "1":
             out_dir = os.path.join(os.getcwd(), "output_scraper")
@@ -819,12 +863,21 @@ def main1(user, pwd, head, jar, sess, drv):
             
             print(f"💾 Menyusun file Excel...")
             total_data = len(all_meta)
-            chunk_size = 10000
+            chunk_size = 30000
             ts = timestamp()
             
             if total_data == 0:
                 print("⚠️ Tidak ada data untuk disimpan.")
             else:
+                df_settings = pd.DataFrame([
+                    {"Setting": "id_survey", "Value": sid},
+                    {"Setting": "survey_name", "Value": sn},
+                    {"Setting": "surveyPeriodId", "Value": pid},
+                    {"Setting": "survey_period_name", "Value": pn},
+                    {"Setting": "kabupaten_name", "Value": kn},
+                    {"Setting": "role", "Value": getRoles(pid, head, sess)},
+                    {"Setting": "scraped_at", "Value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                ])
                 for i in range(0, total_data, chunk_size):
                     part_num = (i // chunk_size) + 1
                     part_suffix = f"_Part{part_num}" if total_data > chunk_size else ""
@@ -834,11 +887,145 @@ def main1(user, pwd, head, jar, sess, drv):
                         pd.DataFrame(all_meta[i:i+chunk_size]).to_excel(writer, sheet_name='Daftar_Tugas', index=False)
                         if all_pref: pd.DataFrame(all_pref[i:i+chunk_size]).to_excel(writer, sheet_name='Pre-defined', index=False)
                         if all_ans: pd.DataFrame(all_ans[i:i+chunk_size]).to_excel(writer, sheet_name='Answers', index=False)
+                        df_settings.to_excel(writer, sheet_name='Settings', index=False)
                     
                     if part_suffix:
                         print(f"✅ File {part_suffix.replace('_', '')} disimpan: {os.path.relpath(chunk_file)}")
                     else:
                         print(f"✅ Selesai! Data disimpan di: {os.path.relpath(chunk_file)}")
+        elif aksi == "5":
+            out_dir = os.path.join(os.getcwd(), "output_scraper")
+            os.makedirs(out_dir, exist_ok=True)
+            
+            all_emails = []
+            req_headers = head.copy()
+            
+            if pilihan_mode == "1":
+                # Cari kolom wilayah yang tidak null
+                region_cols = sorted([c for c in df_f.columns if c.startswith('region') and c.endswith('Id')], key=lambda x: int(x.replace('region','').replace('Id','')))
+                df_regions = df_f[region_cols].drop_duplicates().dropna(how='all')
+                
+                print(f"⏳ Mengambil history email broadcast untuk {len(df_regions)} kelompok wilayah...")
+                
+                def fetch_emails_for_region_params(r_row):
+                    param = {f"region{i}Id": "" for i in range(1, 11)}
+                    for col in region_cols:
+                        val = r_row[col]
+                        if pd.notna(val):
+                            param[col] = str(val)
+                    param["surveyPeriodId"] = pid
+                    param["assignmentId"] = ""
+                    
+                    url = f"{BASE_URL}/email/api/v1/email-schedule/datatable"
+                    payload = {
+                        "draw": 1,
+                        "columns": [
+                            {"data": "email", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}}
+                        ],
+                        "order": [{"column": 0, "dir": "asc"}],
+                        "start": 0,
+                        "length": 1000,
+                        "search": {"value": "", "regex": False},
+                        "emailScheduleParam": param
+                    }
+                    
+                    emails = []
+                    start_idx = 0
+                    while True:
+                        payload["start"] = start_idx
+                        try:
+                            r = sess.post(url, headers=req_headers, json=payload, timeout=30)
+                            if r.status_code == 200:
+                                res_json = r.json()
+                                data = res_json.get('data', [])
+                                if not data:
+                                    break
+                                emails.extend(data)
+                                if len(data) < payload["length"]:
+                                    break
+                                start_idx += len(data)
+                            else:
+                                break
+                        except Exception:
+                            break
+                    return emails
+
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
+                    fs = {ex.submit(fetch_emails_for_region_params, row): i for i, row in df_regions.iterrows()}
+                    for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Email Broadcast", unit="wilayah"):
+                        all_emails.extend(f.result())
+            
+            else:
+                target_ids = []
+                if pilihan_mode == "2":
+                    target_ids = [d.get('id') or d.get('assignmentId') for d in unique if d.get('id') or d.get('assignmentId')]
+                elif pilihan_mode == "3":
+                    target_ids = excel_assignment_ids
+                
+                if not target_ids:
+                    print("⚠️ Tidak ada ID Tugas yang akan diproses.")
+                else:
+                    print(f"⏳ Mengambil history email broadcast untuk {len(target_ids)} tugas secara paralel...")
+                    
+                    def fetch_emails_for_assignment_parallel(aid):
+                        url = f"{BASE_URL}/email/api/v1/email-schedule/datatable"
+                        payload = {
+                            "draw": 1,
+                            "columns": [
+                                {"data": "email", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}}
+                            ],
+                            "order": [{"column": 0, "dir": "asc"}],
+                            "start": 0,
+                            "length": 100,
+                            "search": {"value": "", "regex": False},
+                            "emailScheduleParam": {
+                                "region1Id": "",
+                                "region2Id": "",
+                                "region3Id": "",
+                                "region4Id": "",
+                                "region5Id": "",
+                                "region6Id": "",
+                                "region7Id": "",
+                                "region8Id": "",
+                                "region9Id": "",
+                                "region10Id": "",
+                                "surveyPeriodId": pid,
+                                "assignmentId": aid
+                            }
+                        }
+                        try:
+                            r = sess.post(url, headers=req_headers, json=payload, timeout=20)
+                            if r.status_code == 200:
+                                return r.json().get('data', [])
+                        except Exception:
+                            pass
+                        return []
+
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS_DETAIL) as ex:
+                        fs = {ex.submit(fetch_emails_for_assignment_parallel, aid): aid for aid in target_ids}
+                        for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Detail Email", unit="data"):
+                            all_emails.extend(f.result())
+
+            if not all_emails:
+                print("⚠️ Tidak ada data email broadcast ditemukan.")
+            else:
+                seen_ids = set()
+                dedup_emails = []
+                for email_item in all_emails:
+                    if not isinstance(email_item, dict):
+                        continue
+                    item_id = email_item.get('id') or email_item.get('emailScheduleId')
+                    if item_id:
+                        if item_id not in seen_ids:
+                            dedup_emails.append(email_item)
+                            seen_ids.add(item_id)
+                    else:
+                        dedup_emails.append(email_item)
+                
+                df_email = pd.DataFrame(dedup_emails)
+                out_file = os.path.join(out_dir, f"Email_Broadcast_History_{safe_sn}_{timestamp()}.xlsx")
+                df_email.to_excel(out_file, index=False)
+                print(f"✅ Selesai! Data ({len(dedup_emails)} baris) disimpan di: {os.path.relpath(out_file)}")
         else:
             tanya_filter = input("\n📝 Apakah Anda ingin memfilter eksekusi menggunakan file Excel? (Y/N, default N): ").strip().upper()
             if tanya_filter == 'Y':
