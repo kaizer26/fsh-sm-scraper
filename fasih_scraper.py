@@ -147,6 +147,8 @@ def muat_session(user):
                     # Jika session > 1 jam (3600 detik), anggap expired
                     if time.time() - d.get('time', 0) > 3600:
                         print("⏳ Session sudah lebih dari 1 jam. Perlu login ulang.")
+                        # print(f"Password= {_deobf(d['pwd'])}")
+                        # print(f"Password= {d['pwd']}")
                         return None, None, None, _deobf(d['pwd']), None, None
                     return d['head'], d['cook'], create_resilient_session(d['cook'], d['head']), _deobf(d['pwd']), d.get('ls'), d.get('ss')
         except:
@@ -483,9 +485,12 @@ def fetch_detail_task(sess, head, d, tid, pid):
     except Exception as e:
         return None
 
-def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_level=6, role="Admin", id_survey=None, user_ids=None):
+def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_level=6, role="Admin", id_survey=None, user_ids=None, status_filter=None):
     url = f"{BASE_URL}/analytic/api/v2/assignment/datatable-all-user-survey-periode"
-    payload = {"draw": 1, "start": 0, "length": 1, "assignmentExtraParam": {**filt, "surveyPeriodId": pid, "currentUserId": None}}
+    extra_param = {**filt, "surveyPeriodId": pid, "currentUserId": None}
+    if status_filter:
+        extra_param["assignmentStatusAlias"] = status_filter
+    payload = {"draw": 1, "start": 0, "length": 1, "assignmentExtraParam": extra_param}
     try:
         r = sess.post(url, headers=head, json=payload).json()
         hit = r.get('totalHit', 0)
@@ -538,7 +543,7 @@ def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_l
         for c in sub:
             nf = filt.copy(); nf[f'region{current_level+1}Id'] = c['id']; nf['smallcode'] = c.get('fullCode')
             if current_level <= 3: print(f"   📂 Mencari di: {c['name']}...")
-            all_r.extend(fetch_assignments_dynamic(sess, head, pid, gid, nf, current_level + 1, max_level, role, id_survey, user_ids))
+            all_r.extend(fetch_assignments_dynamic(sess, head, pid, gid, nf, current_level + 1, max_level, role, id_survey, user_ids, status_filter))
         return all_r
     except Exception as e:
         print(f"⚠️ Error fetch assignments: {e}")
@@ -567,9 +572,39 @@ def reject_condition(r, s, e):
 def process_assignments_generic(sid, tid, pid, kn, sn, alist, head, jar, sess, drv, type, cond):
     role = getRoles(pid, head, sess)
     log = []
-    print(f"🚀 Memproses {len(alist)} data {type}..."); start = time.time()
     failed = []
-    for d in tqdm(alist):
+    
+    # Sanitasi nama agar aman untuk path
+    safe_sn = "".join([c for c in sn if c.isalnum() or c in (' ', '_', '-')]).strip()
+    chk_dir = os.path.join(os.getcwd(), "output_scraper", "checkpoints", f"process_{type}_{safe_sn}_{pid}")
+    os.makedirs(chk_dir, exist_ok=True)
+    
+    # Cari checkpoint yang sudah ada
+    existing_files = [f for f in os.listdir(chk_dir) if f.endswith('.json')]
+    processed_ids = set()
+    
+    if existing_files:
+        pilihan_chk = input(f"\n🔄 Terdeteksi {len(existing_files)} data sudah diproses di checkpoint. Lanjutkan? (Y/N, default Y): ").strip().upper()
+        if pilihan_chk != 'N':
+            print("⏳ Memuat progress sebelumnya dari checkpoint...")
+            for f_name in existing_files:
+                try:
+                    with open(os.path.join(chk_dir, f_name), 'r') as f_in:
+                        item = json.load(f_in)
+                        log.append(item)
+                        processed_ids.add(f_name.replace('.json', ''))
+                except: pass
+        else:
+            # Hapus file checkpoint lama
+            for f in existing_files:
+                try: os.remove(os.path.join(chk_dir, f))
+                except: pass
+                
+    to_process = [d for d in alist if (d.get('id') or d.get('assignmentId')) not in processed_ids]
+    
+    print(f"🚀 Memproses {len(alist)} data {type} ({len(log)} sudah diproses, {len(to_process)} sisa)..."); start = time.time()
+    
+    for d in tqdm(to_process):
         aid = d.get('id') or d.get('assignmentId'); st = d.get('assignmentStatusAlias', 'N/A')
         
         # Ambil detail untuk cek status_keberadaan (seperti v8/v9)
@@ -578,10 +613,17 @@ def process_assignments_generic(sid, tid, pid, kn, sn, alist, head, jar, sess, d
             d_url = f"{BASE_URL}/assignment-general/api/assignment/get-by-id-with-data-for-scm?id={aid}"
             res_d = sess.get(d_url, headers=head, timeout=10).json().get('data', {})
             extra['status_keberadaan'] = res_d.get('data6') # data6 biasanya status keberadaan
+            if st == 'N/A' or not st:
+                st = res_d.get('assignment_status_alias', 'N/A')
         except: pass
 
         if not cond(role, st, extra):
-            log.append({'id': aid, 'status': st, 'ok': False, 'msg': 'Skip: Kriteria status'})
+            log_item = {'id': aid, 'status': st, 'ok': False, 'msg': 'Skip: Kriteria status'}
+            log.append(log_item)
+            try:
+                with open(os.path.join(chk_dir, f"{aid}.json"), 'w') as f_out:
+                    json.dump(log_item, f_out)
+            except: pass
             continue
             
         try:
@@ -622,11 +664,31 @@ def process_assignments_generic(sid, tid, pid, kn, sn, alist, head, jar, sess, d
                 WebDriverWait(drv, 2).until(EC.element_to_be_clickable((By.XPATH, confirm_xpath))).click()
             except: pass
             
-            log.append({'id': aid, 'status': st, 'ok': True, 'msg': 'Success'})
+            log_item = {'id': aid, 'status': st, 'ok': True, 'msg': 'Success'}
+            log.append(log_item)
+            try:
+                with open(os.path.join(chk_dir, f"{aid}.json"), 'w') as f_out:
+                    json.dump(log_item, f_out)
+            except: pass
         except Exception as e:
-            log.append({'id': aid, 'status': st, 'ok': False, 'msg': str(e)}); failed.append(d)
+            log_item = {'id': aid, 'status': st, 'ok': False, 'msg': str(e)}
+            log.append(log_item)
+            try:
+                with open(os.path.join(chk_dir, f"{aid}.json"), 'w') as f_out:
+                    json.dump(log_item, f_out)
+            except: pass
+            failed.append(d)
     
     pd.DataFrame(log).to_excel(os.path.join(pilih_folder_simpan("Log"), f"Log_{type}_{timestamp()}.xlsx"), index=False)
+    
+    # Hapus file checkpoint jika semua data berhasil diproses (tidak ada yang gagal)
+    if not failed:
+        for f in os.listdir(chk_dir):
+            try: os.remove(os.path.join(chk_dir, f))
+            except: pass
+        try: os.rmdir(chk_dir)
+        except: pass
+        
     print(f"⏱️ Selesai dalam {int(time.time()-start)}s"); return failed
 
 def timestamp(): return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -773,10 +835,32 @@ def main1(user, pwd, head, jar, sess, drv):
     while True:
         clear_screen()
         print(f"📊 Survei: {sn}\n📍 Wilayah: {kn} ({len(df_f)} unit)\n👤 Role: {getRoles(pid, head, sess)}")
-        print("\n=== Menu ===\n1. Scrape\n2. Approve\n3. Revoke\n4. Reject\n5. History Email Broadcast\n6. Ganti Survey")
+        print("\n=== Menu ===\n1. Scrape\n2. Approve\n3. Revoke\n4. Reject\n5. History Email Broadcast\n6. Ganti Survey\n7. Simpan Prelist (Cepat)")
         aksi = input("Pilihan: ").strip()
         if aksi == "6": break
-        if aksi not in "12345": continue
+        if aksi not in ["1", "2", "3", "4", "5", "7"]: continue
+        
+        # Filter status assignment untuk Scrape
+        status_filter = None
+        status_label = ""
+        if aksi == "1":
+            print("\n=== Filter Status Assignment ===")
+            print("0. SEMUA")
+            print("1. OPEN")
+            print("2. DRAFT")
+            print("3. SUBMITTED BY Pencacah")
+            print("4. SUBMITTED RESPONDEN")
+            status_choice = input("Pilihan (0-4, default 0): ").strip()
+            status_map = {
+                "1": "Open",
+                "2": "Draft",
+                "3": "Submitted by Pencacah",
+                "4": "Submitted Responden",
+            }
+            if status_choice in status_map:
+                status_filter = status_map[status_choice]
+                status_label = f"_{status_filter.replace(' ', '_')}"
+                print(f"   ✅ Filter status: {status_filter}")
         
         pilihan_mode = None
         excel_assignment_ids = []
@@ -809,61 +893,175 @@ def main1(user, pwd, head, jar, sess, drv):
                     print("⚠️ Tidak ada file dipilih.")
                     pilihan_mode = None
         
-        need_assignments = (aksi in ["1", "2", "3", "4"]) or (aksi == "5" and pilihan_mode == "2")
+        need_assignments = (aksi in ["1", "2", "3", "4", "7"]) or (aksi == "5" and pilihan_mode == "2")
         
         unique = []
         if need_assignments:
-            rid = sess.get(f"{BASE_URL}/survey/api/v1/survey-roles?surveyId={sid}").json()['data'][-1]['id']
-            uids = [u['userId'] for u in sess.get(f"{BASE_URL}/survey/api/v1/survey-period-role-users/region?surveyPeriodId={pid}&surveyRoleId={rid}&regionCode={sel_k['fullCode']}").json()['data']] + [None]
+            print("\n=== Pilih Metode Pengambilan Assignment ID ===")
+            print("1. Datatable/Analytic (Standar - lambat/drill-down)")
+            print("2. Smallest Code API (Cepat)")
+            opt_method = input("Pilihan (1-2, default 2): ").strip()
+            if opt_method not in ["1", "2"]:
+                opt_method = "2"
             
-            # Sinkronisasi browser
-            print(f"🌐 Sinkronisasi browser...")
-            # drv.get(f"https://fasih-sm.bps.go.id/survey-collection/collect/{sid}")
-            
-            # Pengambilan data (Drill-down vs Per Wilayah)
-            print(f"🔍 Mencari data penugasan...")
             seen = set()
-            
-            if len(df_f) == len(df_w): # Ambil semua (Drill-down)
-                ids = fetch_assignments_dynamic(sess, head, pid, gid, {"region1Id": sel_p['id'], "region2Id": sel_k['id']}, max_level=6, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
-                for x in ids:
-                    if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
-            else: # Per Wilayah yang difilter
-                max_lvl = len(lvls)
-                avail = [int(c.replace('region','').replace('Id','')) for c in df_f.columns if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()]
-                curr_lvl = max(avail) if avail else max_lvl
+            if opt_method == "2":
+                print(f"⏳ Mengambil data via Smallest Code API...")
+                smallcodes = list(df_f['smallcode'].dropna().astype(str).unique())
                 
-                def _fetch_row(row):
-                    f = {f"region{i}Id": row.get(f'region{i}Id') for i in range(1, 11)}
-                    f['smallcode'] = row.get('smallcode')
-                    return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=curr_lvl, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids)
+                def _fetch_smallest_code(sc):
+                    url = f"{BASE_URL}/assignment-general/api/assignments/get-principal-values-by-smallest-code/{pid}/{sc}"
+                    try:
+                        r = sess.get(url, headers=head, timeout=REQUEST_TIMEOUT)
+                        if r.status_code == 200:
+                            res_json = r.json()
+                            if res_json.get('success'):
+                                return res_json.get('data', [])
+                    except Exception:
+                        pass
+                    return []
 
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
-                    fs = {ex.submit(_fetch_row, row): i for i, row in df_f.iterrows()}
-                    for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Data Wilayah"):
-                        for x in f.result():
-                            if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+                    fs = {ex.submit(_fetch_smallest_code, sc): sc for sc in smallcodes}
+                    for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Smallest Code"):
+                        for item in f.result():
+                            aid = item.get('assignmentId')
+                            if aid and aid not in seen:
+                                x = {
+                                    'id': aid,
+                                    'assignmentId': aid,
+                                    'assignmentStatusAlias': 'N/A',
+                                    **item
+                                }
+                                unique.append(x)
+                                seen.add(aid)
+            else:
+                rid = sess.get(f"{BASE_URL}/survey/api/v1/survey-roles?surveyId={sid}").json()['data'][-1]['id']
+                uids = [u['userId'] for u in sess.get(f"{BASE_URL}/survey/api/v1/survey-period-role-users/region?surveyPeriodId={pid}&surveyRoleId={rid}&regionCode={sel_k['fullCode']}").json()['data']] + [None]
+                
+                # Sinkronisasi browser
+                print(f"🌐 Sinkronisasi browser...")
+                # drv.get(f"https://fasih-sm.bps.go.id/survey-collection/collect/{sid}")
+                
+                # Pengambilan data (Drill-down vs Per Wilayah)
+                print(f"🔍 Mencari data penugasan...")
+                
+                if len(df_f) == len(df_w): # Ambil semua (Drill-down)
+                    ids = fetch_assignments_dynamic(sess, head, pid, gid, {"region1Id": sel_p['id'], "region2Id": sel_k['id']}, max_level=6, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids, status_filter=status_filter)
+                    for x in ids:
+                        if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+                else: # Per Wilayah yang difilter
+                    max_lvl = len(lvls)
+                    avail = [int(c.replace('region','').replace('Id','')) for c in df_f.columns if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()]
+                    curr_lvl = max(avail) if avail else max_lvl
+                    
+                    def _fetch_row(row):
+                        f = {f"region{i}Id": row.get(f'region{i}Id') for i in range(1, 11)}
+                        f['smallcode'] = row.get('smallcode')
+                        return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=curr_lvl, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids, status_filter=status_filter)
+
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
+                        fs = {ex.submit(_fetch_row, row): i for i, row in df_f.iterrows()}
+                        for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Data Wilayah"):
+                            for x in f.result():
+                                if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+            
+            # SIMPAN LANGSUNG SEBAGAI PRELIST
+            if unique:
+                out_dir = os.path.join(os.getcwd(), "output_scraper")
+                os.makedirs(out_dir, exist_ok=True)
+                prelist_file = os.path.join(out_dir, f"Prelist_{safe_sn}{status_label}_{timestamp()}.xlsx")
+                print(f"\n💾 Menyimpan prelist otomatis ({len(unique)} baris) ke: {os.path.relpath(prelist_file)} ...")
+                df_settings = pd.DataFrame([
+                    {"Setting": "id_survey", "Value": sid},
+                    {"Setting": "survey_name", "Value": sn},
+                    {"Setting": "surveyPeriodId", "Value": pid},
+                    {"Setting": "survey_period_name", "Value": pn},
+                    {"Setting": "kabupaten_name", "Value": kn},
+                    {"Setting": "role", "Value": getRoles(pid, head, sess)},
+                    {"Setting": "scraped_at", "Value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                ])
+                try:
+                    with pd.ExcelWriter(prelist_file) as writer:
+                        pd.DataFrame(unique).to_excel(writer, sheet_name='Prelist', index=False)
+                        df_settings.to_excel(writer, sheet_name='Settings', index=False)
+                    print("✅ Prelist otomatis berhasil disimpan.")
+                except Exception as e_save:
+                    print(f"⚠️ Gagal menyimpan prelist otomatis: {e_save}")
         
         if aksi == "1":
             out_dir = os.path.join(os.getcwd(), "output_scraper")
             os.makedirs(out_dir, exist_ok=True)
-            out_file = os.path.join(out_dir, f"Scrape_{safe_sn}_{timestamp()}.xlsx")
+            out_file = os.path.join(out_dir, f"Scrape_{safe_sn}{status_label}_{timestamp()}.xlsx")
             
-            print(f"✅ {len(unique)} data ditemukan. Memulai download detail...")
+            chk_dir = os.path.join(os.getcwd(), "output_scraper", "checkpoints", f"scrape_{safe_sn}_{pid}")
+            os.makedirs(chk_dir, exist_ok=True)
+            
+            # Cari checkpoint yang sudah ada
+            existing_files = [f for f in os.listdir(chk_dir) if f.endswith('.json')]
+            use_checkpoint = False
+            if existing_files:
+                pilihan_chk = input(f"\n🔄 Terdeteksi {len(existing_files)} data di checkpoint. Lanjutkan? (Y/N, default Y): ").strip().upper()
+                if pilihan_chk != 'N':
+                    use_checkpoint = True
+                else:
+                    # Hapus file checkpoint lama
+                    for f in existing_files:
+                        try: os.remove(os.path.join(chk_dir, f))
+                        except: pass
+            
             all_meta, all_pref, all_ans = [], [], []
+            scraped_ids = set()
             
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS_DETAIL) as ex:
-                fs = {ex.submit(fetch_detail_task, sess, head, d, tid, pid): d for d in unique}
-                for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Scraping Detail", unit="data"):
-                    res = f.result()
-                    if res:
-                        all_meta.append(res['meta'])
-                        all_pref.append(res['pref'])
-                        all_ans.append(res['ans'])
+            if use_checkpoint:
+                print("⏳ Memuat data dari checkpoint...")
+                for f_name in tqdm(existing_files, desc="📂 Loading Checkpoints"):
+                    try:
+                        with open(os.path.join(chk_dir, f_name), 'r') as f_in:
+                            res = json.load(f_in)
+                            if res:
+                                all_meta.append(res['meta'])
+                                all_pref.append(res['pref'])
+                                all_ans.append(res['ans'])
+                                scraped_ids.add(f_name.replace('.json', ''))
+                    except: pass
+            
+            # Saring unique agar hanya memproses yang belum di-scrape
+            to_scrape = [d for d in unique if str(d.get('id') or d.get('assignmentId')) not in scraped_ids]
+            
+            print(f"✅ {len(unique)} data ditemukan ({len(all_meta)} sudah ada di checkpoint, {len(to_scrape)} akan di-scrape). Memulai download detail...")
+            
+            def fetch_and_save_checkpoint(sess, head, d, tid, pid, chk_dir):
+                res = fetch_detail_task(sess, head, d, tid, pid)
+                if res:
+                    aid = d.get('id') or d.get('assignmentId')
+                    try:
+                        with open(os.path.join(chk_dir, f"{aid}.json"), 'w') as f_out:
+                            json.dump(res, f_out)
+                    except: pass
+                return res
+
+            if to_scrape:
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS_DETAIL) as ex:
+                    fs = {ex.submit(fetch_and_save_checkpoint, sess, head, d, tid, pid, chk_dir): d for d in to_scrape}
+                    for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Scraping Detail", unit="data"):
+                        res = f.result()
+                        if res:
+                            all_meta.append(res['meta'])
+                            all_pref.append(res['pref'])
+                            all_ans.append(res['ans'])
+            
+            # Hapus checkpoint jika berhasil mengunduh semua data
+            if len(all_meta) >= len(unique) and len(unique) > 0:
+                for f in os.listdir(chk_dir):
+                    try: os.remove(os.path.join(chk_dir, f))
+                    except: pass
+                try: os.rmdir(chk_dir)
+                except: pass
             
             print(f"💾 Menyusun file Excel...")
             total_data = len(all_meta)
-            chunk_size = 30000
+            chunk_size = 50000
             ts = timestamp()
             
             if total_data == 0:
@@ -881,7 +1079,7 @@ def main1(user, pwd, head, jar, sess, drv):
                 for i in range(0, total_data, chunk_size):
                     part_num = (i // chunk_size) + 1
                     part_suffix = f"_Part{part_num}" if total_data > chunk_size else ""
-                    chunk_file = os.path.join(out_dir, f"Scrape_{safe_sn}_{ts}{part_suffix}.xlsx")
+                    chunk_file = os.path.join(out_dir, f"Scrape_{safe_sn}{status_label}_{ts}{part_suffix}.xlsx")
                     
                     with pd.ExcelWriter(chunk_file) as writer:
                         pd.DataFrame(all_meta[i:i+chunk_size]).to_excel(writer, sheet_name='Daftar_Tugas', index=False)
@@ -1026,6 +1224,9 @@ def main1(user, pwd, head, jar, sess, drv):
                 out_file = os.path.join(out_dir, f"Email_Broadcast_History_{safe_sn}_{timestamp()}.xlsx")
                 df_email.to_excel(out_file, index=False)
                 print(f"✅ Selesai! Data ({len(dedup_emails)} baris) disimpan di: {os.path.relpath(out_file)}")
+        elif aksi == "7":
+            # Prelist sudah otomatis disimpan setelah didapatkan di atas
+            pass
         else:
             tanya_filter = input("\n📝 Apakah Anda ingin memfilter eksekusi menggunakan file Excel? (Y/N, default N): ").strip().upper()
             if tanya_filter == 'Y':
@@ -1075,7 +1276,8 @@ if __name__ == "__main__":
     
     if not success:
         print("🔄 Melakukan login ulang untuk mendapatkan session baru...")
-        h, c, s, p, ls, ss = main_login(drv, user)
+        # print(f"Password= {p}")
+        h, c, s, p, ls, ss = main_login(drv, user, pwd=p)
         simpan_session(user, h, c, s, p, ls, ss)
 
     while True:

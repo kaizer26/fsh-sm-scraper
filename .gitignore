@@ -24,3 +24,7 @@ Hasil/
 # OS files
 .DS_Store
 Thumbs.db
+
+
+# Script Python Sampah
+fasih_sm_scrape -*
