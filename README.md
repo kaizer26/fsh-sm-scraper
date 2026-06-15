@@ -21,8 +21,8 @@ Sebelum menjalankan script, pastikan Anda telah menginstal:
 
 1. **Clone Repositori**:
    ```bash
-   git clone https://github.com/username/fasih-sm-scrape.git
-   cd fasih-sm-scrape
+   git clone https://github.com/kaizer26/fsh-sm-scraper.git
+   cd fsh-sm-scraper
    ```
 
 2. **Instalasi Dependency**:
