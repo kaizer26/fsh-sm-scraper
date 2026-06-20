@@ -31,3 +31,5 @@ Thumbs.db
 
 # Script Python Sampah
 fasih_sm_scrape -*
+fasih_scraper_backup.py
+*.bat
