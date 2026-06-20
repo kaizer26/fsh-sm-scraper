@@ -433,10 +433,12 @@ def ambil_semua_sls_parallel(kid, lvls, gid, head, jar, r1, r2):
 
 def flatten_val(val):
     if isinstance(val, list):
-        return ', '.join([str(v.get('label', v)) if isinstance(v, dict) else str(v) for v in val])
-    if isinstance(val, dict):
-        return str(val.get('label', val.get('value', str(val))))
-    return str(val) if val is not None else ""
+        result = ', '.join([str(v.get('label', v)) if isinstance(v, dict) else str(v) for v in val])
+    elif isinstance(val, dict):
+        result = str(val.get('label', val.get('value', str(val))))
+    else:
+        result = str(val) if val is not None else ""
+    return "too long" if len(result) > 1000 else result
 
 def safe_extract_data(items):
     result = {}
@@ -446,9 +448,55 @@ def safe_extract_data(items):
         if key: result[key] = flatten_val(item.get('answer'))
     return result
 
+import ast
+import numpy as np
+import pandas as pd
+
+
+def ekstrak_full_code_dari_string(data):
+    # 1. Antisipasi jika data kosong (NaN)
+    if pd.isna(data):
+        return None
+
+    # 2. Jika tipe data masih string, ubah menjadi dictionary asli Python
+    if isinstance(data, str):
+        try:
+            data = ast.literal_eval(data)
+        except (ValueError, SyntaxError):
+            # Jika string rusak atau bukan format dict/json yang valid
+            return None
+
+    # 3. Pastikan sekarang tipe datanya sudah benar-block berupa dictionary
+    if not isinstance(data, dict):
+        return None
+
+    # 4. Jalankan logika penelusuran level terdalam seperti sebelumnya
+    current = data
+    deepest_full_code = None
+
+    while current and isinstance(current, dict):
+        if "full_code" in current:
+            deepest_full_code = current["full_code"]
+
+        next_level_key = None
+        for key in current.keys():
+            if key.startswith("level_") and current[key] is not None:
+                next_level_key = key
+                break
+
+        if next_level_key:
+            current = current[next_level_key]
+        else:
+            break
+
+    return deepest_full_code
+
+
 def fetch_detail_task(sess, head, d, tid, pid):
     aid = d.get('id') or d.get('assignmentId')
-    url = f"{BASE_URL}/assignment-general/api/assignment/get-by-id-with-data-for-scm?id={aid}"
+    # url = f"{BASE_URL}/assignment-general/api/assignment/get-by-id-with-data-for-scm?id={aid}"
+    url = f"https://fasih-sm.bps.go.id/app/api/assignment-general/api/assignment/get-by-assignment-id?assignmentId={aid}"
+    
     try:
         res = sess.get(url, headers=head, timeout=REQUEST_TIMEOUT).json().get('data', {})
         if not res: return None
@@ -459,6 +507,7 @@ def fetch_detail_task(sess, head, d, tid, pid):
             'current_user': res.get('current_user_username', ''),
             'status': res.get('assignment_status_alias', ''),
             'identity': res.get('code_identity', ''),
+            'region': res.get('region', ''),
             'data1': res.get('data1', ''),
             'data2': res.get('data2', ''),
             'data3': res.get('data3', ''),
@@ -567,7 +616,12 @@ def revoke_condition(r, s, e):
     return str(r).lower() == 'pengawas' and str(s).lower() == 'completed by pengawas' and str(e.get('status_keberadaan', '')).lower() == '3. tidak ditemukan'
 
 def reject_condition(r, s, e):
-    return str(r).lower() == 'pengawas' and str(s).lower() == 'submitted by pencacah' and str(e.get('status_keberadaan', '')).lower() == '3. tidak ditemukan'
+    r_lower, s_lower = str(r).lower(), str(s).lower()
+    return (
+        (r_lower == 'pengawas' and s_lower == 'submitted by pencacah' and str(e.get('status_keberadaan', '')).lower() == '3. tidak ditemukan') or
+        (r_lower == 'pml' and s_lower == 'submitted by ppl') or
+        (r_lower == 'admin kabupaten' and s_lower == 'submitted by ppl')
+    )
 
 def process_assignments_generic(sid, tid, pid, kn, sn, alist, head, jar, sess, drv, type, cond):
     role = getRoles(pid, head, sess)
@@ -692,6 +746,310 @@ def process_assignments_generic(sid, tid, pid, kn, sn, alist, head, jar, sess, d
     print(f"⏱️ Selesai dalam {int(time.time()-start)}s"); return failed
 
 def timestamp(): return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# ====================================================================
+# REKAP ALOKASI PETUGAS
+# ====================================================================
+def rekap_alokasi_petugas(sid, pid, pn, sn, head, sess):
+    """Rekap alokasi petugas berdasarkan role yang dipilih."""
+    clear_screen()
+    print(f"\n{'='*50}")
+    print(f"📋 REKAP ALOKASI PETUGAS")
+    print(f"{'='*50}")
+    print(f"📊 Survei : {sn}")
+    print(f"📅 Periode: {pn}")
+    print(f"{'='*50}")
+
+    # 1. Ambil daftar roles
+    print("\n⏳ Mengambil daftar roles...")
+    try:
+        r = sess.get(f"{BASE_URL}/app/api/survey/api/v1/survey-roles?surveyId={sid}", headers=head, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            print(f"❌ Gagal mengambil roles. HTTP Status: {r.status_code}")
+            return
+        roles_data = r.json().get('data', [])
+    except Exception as e:
+        print(f"❌ Error mengambil roles: {e}")
+        return
+
+    if not roles_data:
+        print("⚠️ Tidak ada roles ditemukan untuk survei ini.")
+        return
+
+    # 2. Tampilkan roles
+    print("\n=== Daftar Roles ===")
+    for i, role in enumerate(roles_data):
+        print(f"  {i+1}. {role.get('description', role.get('name', 'N/A'))}")
+
+    # 3. User memilih (bisa lebih dari 1)
+    print("\n💡 Bisa pilih lebih dari 1, pisahkan dengan koma.")
+    print("   Contoh: 1,3,4 atau 'all' untuk semua")
+    pilihan_input = input("Pilih role: ").strip().lower()
+
+    selected_roles = []
+    if pilihan_input == 'all':
+        selected_roles = roles_data
+    else:
+        try:
+            indices = [int(x.strip()) - 1 for x in pilihan_input.split(',')]
+            for idx in indices:
+                if 0 <= idx < len(roles_data):
+                    selected_roles.append(roles_data[idx])
+        except ValueError:
+            print("⚠️ Input tidak valid.")
+            return
+
+    if not selected_roles:
+        print("⚠️ Tidak ada role yang dipilih.")
+        return
+
+    print(f"\n✅ Role terpilih: {', '.join([r.get('description', r.get('name', '')) for r in selected_roles])}")
+
+    # 4. Ambil data alokasi untuk setiap role
+    all_allocations = []
+    for role in selected_roles:
+        role_id = role['id']
+        role_desc = role.get('description', role.get('name', 'N/A'))
+        print(f"\n📥 Mengambil data alokasi untuk role: {role_desc}...")
+
+        # Fetch halaman pertama untuk mendapatkan totalPages
+        try:
+            url = f"{BASE_URL}/app/api/survey-user/api/v1/allocations-view/by-user?surveyRoleId={role_id}&surveyPeriodId={pid}&page=0&size=100"
+            r = sess.get(url, headers=head, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                print(f"   ⚠️ Gagal mengambil data untuk role {role_desc}. HTTP Status: {r.status_code}")
+                continue
+            resp_data = r.json().get('data', {})
+            total_pages = resp_data.get('totalPages', 1)
+            total_elements = resp_data.get('totalElements', 0)
+            content = resp_data.get('content', [])
+        except Exception as e:
+            print(f"   ❌ Error: {e}")
+            continue
+
+        # Tambahkan info role ke setiap record
+        for item in content:
+            item['_role'] = role_desc
+        all_allocations.extend(content)
+        print(f"   📄 Halaman 1/{total_pages} ({len(content)} data, total: {total_elements})")
+
+        # Fetch halaman selanjutnya
+        if total_pages > 1:
+            def _fetch_alloc_page(page_num, _role_id=role_id):
+                try:
+                    url = f"{BASE_URL}/app/api/survey-user/api/v1/allocations-view/by-user?surveyRoleId={_role_id}&surveyPeriodId={pid}&page={page_num}&size=100"
+                    r = sess.get(url, headers=head, timeout=REQUEST_TIMEOUT)
+                    if r.status_code == 200:
+                        return r.json().get('data', {}).get('content', [])
+                except Exception:
+                    pass
+                return []
+
+            with ThreadPoolExecutor(max_workers=min(MAX_WORKERS_WILAYAH, total_pages - 1)) as ex:
+                fs = {ex.submit(_fetch_alloc_page, p): p for p in range(1, total_pages)}
+                for f in tqdm(as_completed(fs), total=len(fs), desc=f"   📥 Fetching {role_desc}", unit="page"):
+                    page_content = f.result()
+                    for item in page_content:
+                        item['_role'] = role_desc
+                    all_allocations.extend(page_content)
+
+        print(f"   ✅ Total data untuk {role_desc}: {total_elements}")
+
+    if not all_allocations:
+        print("\n⚠️ Tidak ada data alokasi ditemukan.")
+        return
+
+    # 5. Flatten regions: setiap region jadi 1 baris
+    print(f"\n📊 Total user alokasi: {len(all_allocations)}")
+    print("⏳ Memproses data (flatten regions)...")
+    rows = []
+    for item in all_allocations:
+        user_info = {
+            'userId': item.get('userId', ''),
+            'username': item.get('username', ''),
+            'email': item.get('email', ''),
+            'roleId': item.get('roleId', ''),
+            'roleName': item.get('_role', ''),
+        }
+        regions = item.get('regions', [])
+        if regions:
+            for reg in regions:
+                row = {**user_info}
+                row['regionCode'] = reg.get('regionCode', '')
+                row['regionName'] = reg.get('regionName', '')
+                row['level'] = reg.get('level', '')
+                row['allocationId'] = reg.get('allocationId', '')
+                rows.append(row)
+        else:
+            # User tanpa regions tetap masuk 1 baris
+            rows.append(user_info)
+
+    # 6. Simpan ke Excel
+    out_dir = os.path.join(os.getcwd(), "output_scraper")
+    os.makedirs(out_dir, exist_ok=True)
+    safe_sn = "".join([c for c in sn if c.isalnum() or c in (' ', '_', '-')]).strip()
+    safe_pn = "".join([c for c in pn if c.isalnum() or c in (' ', '_', '-')]).strip()
+    out_file = os.path.join(out_dir, f"Rekap_Alokasi_{safe_sn}_{safe_pn}_{timestamp()}.xlsx")
+
+    df = pd.DataFrame(rows, columns=['userId', 'username', 'email', 'roleId', 'roleName', 'regionCode', 'regionName', 'level', 'allocationId'])
+    df.to_excel(out_file, index=False)
+    print(f"✅ Data berhasil disimpan ke: {os.path.relpath(out_file)}")
+    print(f"   📁 {len(df)} baris x {len(df.columns)} kolom")
+
+
+# ====================================================================
+# REKAP PROGRESS ASSIGNMENT
+# ====================================================================
+def ambil_rekap_progress(sid, pid, pn, sn, kn, head, sess, df_f, safe_sn, safe_pn):
+    """Ambil rekap progress assignment berdasarkan wilayah."""
+    clear_screen()
+    print(f"\n{'='*50}")
+    print(f"📈 AMBIL REKAP PROGRESS")
+    print(f"{'='*50}")
+    print(f"📊 Survei  : {sn}")
+    print(f"📅 Periode : {pn}")
+    print(f"📍 Wilayah : {kn} ({len(df_f)} unit)")
+    print(f"{'='*50}")
+
+    url = f"{BASE_URL}/app/api/analytic/api/v2/assignment/report-progress-assignment"
+
+    # 1. Tentukan level terdalam yang memiliki data di df_f
+    avail = sorted([int(c.replace('region','').replace('Id',''))
+                    for c in df_f.columns
+                    if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()])
+    if not avail:
+        print("⚠️ Tidak ada data region di wilayah terpilih.")
+        return
+    max_lvl = max(avail)
+    print(f"\n🔍 Level region tersedia: {avail} (terdalam: level {max_lvl})")
+
+    # 2. Helper: bangun payload
+    def _build_payload(region_dict, target_lvl):
+        payload = {
+            "surveyPeriodId": pid,
+            "assignmentStatusAlias": None,
+            "assignmentErrorStatusType": -1,
+            "currentUserId": None,
+            "userIdResponsibility": None,
+            "regionId": None,
+        }
+        for i in range(1, 11):
+            payload[f'data{i}'] = None
+            key = f'region{i}Id'
+            if i <= target_lvl and key in region_dict:
+                val = region_dict[key]
+                payload[key] = val if pd.notna(val) else None
+            else:
+                payload[key] = None
+        return payload
+
+    # 3. Tes level terdalam dulu, jika null fallback 1 level ke atas
+    target_lvl = max_lvl
+    hierarchy_cols = [f'region{i}Id' for i in range(1, target_lvl + 1) if f'region{i}Id' in df_f.columns]
+    unique_regions = df_f[hierarchy_cols].drop_duplicates().reset_index(drop=True)
+    test_row = unique_regions.iloc[0].to_dict()
+
+    print(f"⏳ Menguji level {target_lvl}...")
+    try:
+        test_payload = _build_payload(test_row, target_lvl)
+        test_r = sess.post(url, json=test_payload, headers=head, timeout=REQUEST_TIMEOUT)
+        test_data = test_r.json() if test_r.status_code == 200 else None
+    except:
+        test_data = None
+
+    if not test_data:
+        target_lvl = max_lvl - 1
+        if target_lvl < 1:
+            print("❌ Tidak ada data progress yang bisa diambil.")
+            return
+        print(f"   ⚠️ Level {max_lvl} tidak ada data, mencoba level {target_lvl}...")
+        hierarchy_cols = [f'region{i}Id' for i in range(1, target_lvl + 1) if f'region{i}Id' in df_f.columns]
+        unique_regions = df_f[hierarchy_cols].drop_duplicates().reset_index(drop=True)
+        test_row = unique_regions.iloc[0].to_dict()
+        try:
+            test_payload = _build_payload(test_row, target_lvl)
+            test_r = sess.post(url, json=test_payload, headers=head, timeout=REQUEST_TIMEOUT)
+            test_data = test_r.json() if test_r.status_code == 200 else None
+        except:
+            test_data = None
+        if not test_data:
+            print("❌ Tidak ada data progress yang bisa diambil.")
+            return
+
+    print(f"   ✅ Menggunakan level {target_lvl} ({len(unique_regions)} wilayah unik)")
+
+    # 4. Fetch semua wilayah secara parallel
+    all_results = []
+
+    # Masukkan hasil tes pertama
+    for item in test_data:
+        sc = item.get('label', '')
+        for val in item.get('values', []):
+            all_results.append({
+                'smallcode': sc,
+                'status': val.get('label', ''),
+                'jumlah': val.get('value', 0)
+            })
+
+    # Fetch sisanya (skip index 0 karena sudah diambil di tes)
+    remaining = unique_regions.iloc[1:]
+    if len(remaining) > 0:
+        def _fetch_progress(row_dict):
+            payload = _build_payload(row_dict, target_lvl)
+            try:
+                r = sess.post(url, json=payload, headers=head, timeout=REQUEST_TIMEOUT)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                pass
+            return []
+
+        row_dicts = [row.to_dict() for _, row in remaining.iterrows()]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
+            fs = {ex.submit(_fetch_progress, rd): rd for rd in row_dicts}
+            for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Progress", unit="req"):
+                data = f.result()
+                if data:
+                    for item in data:
+                        sc = item.get('label', '')
+                        for val in item.get('values', []):
+                            all_results.append({
+                                'smallcode': sc,
+                                'status': val.get('label', ''),
+                                'jumlah': val.get('value', 0)
+                            })
+
+    if not all_results:
+        print("\n⚠️ Tidak ada data progress ditemukan.")
+        return
+
+    # 5. Simpan ke Excel (long format)
+    df_long = pd.DataFrame(all_results, columns=['smallcode', 'status', 'jumlah'])
+
+    # Buat juga pivot (wide format) agar lebih mudah dibaca
+    try:
+        df_wide = df_long.pivot_table(index='smallcode', columns='status', values='jumlah', aggfunc='sum', fill_value=0).reset_index()
+        # Urutkan kolom: smallcode, total, lalu status lainnya
+        status_cols = [c for c in df_wide.columns if c not in ['smallcode', 'total']]
+        if 'total' in df_wide.columns:
+            df_wide = df_wide[['smallcode', 'total'] + sorted(status_cols)]
+    except:
+        df_wide = None
+
+    out_dir = os.path.join(os.getcwd(), "output_scraper")
+    os.makedirs(out_dir, exist_ok=True)
+    out_file = os.path.join(out_dir, f"Rekap_Progress_{safe_sn}_{safe_pn}_{timestamp()}.xlsx")
+
+    with pd.ExcelWriter(out_file) as writer:
+        if df_wide is not None:
+            df_wide.to_excel(writer, sheet_name='Rekap (Pivot)', index=False)
+        df_long.to_excel(writer, sheet_name='Detail (Long)', index=False)
+
+    print(f"\n✅ Data berhasil disimpan ke: {os.path.relpath(out_file)}")
+    print(f"   📁 {len(df_long)} baris detail | {len(df_wide) if df_wide is not None else 0} wilayah unik")
+    if df_wide is not None:
+        print(f"   📊 Status: {', '.join([c for c in df_wide.columns if c != 'smallcode'])}")
+
 
 def main1(user, pwd, head, jar, sess, drv):
     global MAX_WORKERS_WILAYAH
@@ -835,32 +1193,48 @@ def main1(user, pwd, head, jar, sess, drv):
     while True:
         clear_screen()
         print(f"📊 Survei: {sn}\n📍 Wilayah: {kn} ({len(df_f)} unit)\n👤 Role: {getRoles(pid, head, sess)}")
-        print("\n=== Menu ===\n1. Scrape\n2. Approve\n3. Revoke\n4. Reject\n5. History Email Broadcast\n6. Ganti Survey\n7. Simpan Prelist (Cepat)")
+        print("\n=== Menu ===\n1. Scrape\n2. Approve\n3. Revoke\n4. Reject\n5. History Email Broadcast\n6. Ganti Survey\n7. Simpan Prelist (Cepat)\n8. Rekap Alokasi Petugas\n9. Ambil Rekap Progress (BELUM UJI COBA)")
         aksi = input("Pilihan: ").strip()
         if aksi == "6": break
+        if aksi == "8":
+            rekap_alokasi_petugas(sid, pid, pn, sn, head, sess)
+            input("\n✅ Selesai. ENTER..."); continue
+        if aksi == "9":
+            ambil_rekap_progress(sid, pid, pn, sn, kn, head, sess, df_f, safe_sn, safe_pn)
+            input("\n✅ Selesai. ENTER..."); continue
         if aksi not in ["1", "2", "3", "4", "5", "7"]: continue
         
         # Filter status assignment untuk Scrape
-        status_filter = None
+        status_filters = []  # List of status filters (empty = SEMUA)
         status_label = ""
         if aksi == "1":
-            print("\n=== Filter Status Assignment ===")
+            print("\n=== Filter Status Assignment (bisa pilih lebih dari 1, pisah koma) ===")
             print("0. SEMUA")
             print("1. OPEN")
             print("2. DRAFT")
             print("3. SUBMITTED BY Pencacah")
-            print("4. SUBMITTED RESPONDEN")
-            status_choice = input("Pilihan (0-4, default 0): ").strip()
+            print("4. SUBMITTED RESPONDENT")
+            print("5. APPROVED BY Pengawas")
+            print("6. REJECTED BY Pengawas")
+            print("7. REVOKED BY Pengawas")
+            status_choice = input("Pilihan (contoh: 1,3,4 atau 0, default 0): ").strip()
             status_map = {
                 "1": "Open",
                 "2": "Draft",
-                "3": "Submitted by Pencacah",
-                "4": "Submitted Responden",
+                "3": "SUBMITTED BY Pencacah",
+                "4": "SUBMITTED RESPONDENT",
+                "5": "APPROVED BY Pengawas",
+                "6": "REJECTED BY Pengawas",
+                "7": "REVOKED BY Pengawas",
             }
-            if status_choice in status_map:
-                status_filter = status_map[status_choice]
-                status_label = f"_{status_filter.replace(' ', '_')}"
-                print(f"   ✅ Filter status: {status_filter}")
+            if status_choice and status_choice != "0":
+                for ch in status_choice.split(","):
+                    ch = ch.strip()
+                    if ch in status_map and status_map[ch] not in status_filters:
+                        status_filters.append(status_map[ch])
+                if status_filters:
+                    status_label = "_" + "_".join([s.replace(' ', '_') for s in status_filters])
+                    print(f"   ✅ Filter status: {', '.join(status_filters)}")
         
         pilihan_mode = None
         excel_assignment_ids = []
@@ -944,27 +1318,38 @@ def main1(user, pwd, head, jar, sess, drv):
                 # drv.get(f"https://fasih-sm.bps.go.id/survey-collection/collect/{sid}")
                 
                 # Pengambilan data (Drill-down vs Per Wilayah)
-                print(f"🔍 Mencari data penugasan...")
+                # Jika ada multi status filter, fetch per status lalu gabungkan
+                filters_to_run = status_filters if status_filters else [None]
                 
-                if len(df_f) == len(df_w): # Ambil semua (Drill-down)
-                    ids = fetch_assignments_dynamic(sess, head, pid, gid, {"region1Id": sel_p['id'], "region2Id": sel_k['id']}, max_level=6, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids, status_filter=status_filter)
-                    for x in ids:
-                        if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
-                else: # Per Wilayah yang difilter
-                    max_lvl = len(lvls)
-                    avail = [int(c.replace('region','').replace('Id','')) for c in df_f.columns if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()]
-                    curr_lvl = max(avail) if avail else max_lvl
+                for sf in filters_to_run:
+                    if sf:
+                        print(f"\n🔍 Mencari data penugasan untuk status: {sf}...")
+                    else:
+                        print(f"\n🔍 Mencari data penugasan (semua status)...")
                     
-                    def _fetch_row(row):
-                        f = {f"region{i}Id": row.get(f'region{i}Id') for i in range(1, 11)}
-                        f['smallcode'] = row.get('smallcode')
-                        return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=curr_lvl, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids, status_filter=status_filter)
+                    if len(df_f) == len(df_w): # Ambil semua (Drill-down)
+                        ids = fetch_assignments_dynamic(sess, head, pid, gid, {"region1Id": sel_p['id'], "region2Id": sel_k['id']}, max_level=6, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids, status_filter=sf)
+                        for x in ids:
+                            if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+                    else: # Per Wilayah yang difilter
+                        max_lvl = len(lvls)
+                        avail = [int(c.replace('region','').replace('Id','')) for c in df_f.columns if c.startswith('region') and c.endswith('Id') and not df_f[c].isnull().all()]
+                        curr_lvl = max(avail) if avail else max_lvl
+                        
+                        _sf_capture = sf  # capture for closure
+                        def _fetch_row(row, _sf=_sf_capture):
+                            f = {f"region{i}Id": row.get(f'region{i}Id') for i in range(1, 11)}
+                            f['smallcode'] = row.get('smallcode')
+                            return fetch_assignments_dynamic(sess, head, pid, gid, f, current_level=curr_lvl, max_level=max_lvl, role=getRoles(pid, head, sess), id_survey=sid, user_ids=uids, status_filter=_sf)
 
-                    with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
-                        fs = {ex.submit(_fetch_row, row): i for i, row in df_f.iterrows()}
-                        for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Fetching Data Wilayah"):
-                            for x in f.result():
-                                if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+                        with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
+                            fs = {ex.submit(_fetch_row, row): i for i, row in df_f.iterrows()}
+                            for f in tqdm(as_completed(fs), total=len(fs), desc=f"📥 Fetching Data Wilayah ({sf or 'Semua'})"):
+                                for x in f.result():
+                                    if x['id'] not in seen and x['assignmentStatusAlias'] != 'Open': unique.append(x); seen.add(x['id'])
+                    
+                    if sf:
+                        print(f"   📊 Status '{sf}': total kumulatif = {len(unique)} data")
             
             # SIMPAN LANGSUNG SEBAGAI PRELIST
             if unique:
