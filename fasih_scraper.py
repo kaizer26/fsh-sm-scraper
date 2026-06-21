@@ -26,6 +26,7 @@ REQUIRED_PACKAGES = [
     ("requests",    "requests"),
     ("pandas",      "pandas"),
     ("openpyxl",    "openpyxl"),
+    ("xlsxwriter",  "xlsxwriter"),
     ("tqdm",        "tqdm"),
     ("selenium",    "selenium"),
     ("urllib3",     "urllib3"),
@@ -1446,7 +1447,6 @@ def main1(user, pwd, head, jar, sess, drv):
             
             print(f"💾 Menyusun file Excel...")
             total_data = len(all_meta)
-            chunk_size = 50000
             ts = timestamp()
             
             if total_data == 0:
@@ -1461,21 +1461,52 @@ def main1(user, pwd, head, jar, sess, drv):
                     {"Setting": "role", "Value": getRoles(pid, head, sess)},
                     {"Setting": "scraped_at", "Value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
                 ])
-                for i in range(0, total_data, chunk_size):
-                    part_num = (i // chunk_size) + 1
-                    part_suffix = f"_Part{part_num}" if total_data > chunk_size else ""
-                    chunk_file = os.path.join(out_dir, f"Scrape_{safe_sn}{status_label}_{ts}{part_suffix}.xlsx")
-                    
-                    with pd.ExcelWriter(chunk_file) as writer:
-                        pd.DataFrame(all_meta[i:i+chunk_size]).to_excel(writer, sheet_name='Daftar_Tugas', index=False)
-                        if all_pref: pd.DataFrame(all_pref[i:i+chunk_size]).to_excel(writer, sheet_name='Pre-defined', index=False)
-                        if all_ans: pd.DataFrame(all_ans[i:i+chunk_size]).to_excel(writer, sheet_name='Answers', index=False)
-                        df_settings.to_excel(writer, sheet_name='Settings', index=False)
-                    
-                    if part_suffix:
-                        print(f"✅ File {part_suffix.replace('_', '')} disimpan: {os.path.relpath(chunk_file)}")
-                    else:
-                        print(f"✅ Selesai! Data disimpan di: {os.path.relpath(chunk_file)}")
+                
+                # Build DataFrames sekali (bagian paling berat)
+                print(f"   ⏳ Membangun tabel Daftar_Tugas ({total_data} baris)...")
+                df_all_meta = pd.DataFrame(all_meta)
+                print(f"   ⏳ Membangun tabel Pre-defined ({len(all_pref)} baris)...")
+                df_all_pref = pd.DataFrame(all_pref) if all_pref else None
+                print(f"   ⏳ Membangun tabel Answers ({len(all_ans)} baris)...")
+                df_all_ans = pd.DataFrame(all_ans) if all_ans else None
+                del all_meta, all_pref, all_ans  # Bebaskan memory
+                
+                EXCEL_ROW_LIMIT = 1000000  # Batas baris Excel (~1,048,576)
+                
+                def _write_excel(filepath, meta_slice, pref_slice, ans_slice):
+                    """Tulis satu file Excel dengan xlsxwriter (cepat) atau fallback openpyxl."""
+                    for eng in ['xlsxwriter', 'openpyxl']:
+                        try:
+                            with pd.ExcelWriter(filepath, engine=eng) as writer:
+                                meta_slice.to_excel(writer, sheet_name='Daftar_Tugas', index=False)
+                                if pref_slice is not None: pref_slice.to_excel(writer, sheet_name='Pre-defined', index=False)
+                                if ans_slice is not None: ans_slice.to_excel(writer, sheet_name='Answers', index=False)
+                                df_settings.to_excel(writer, sheet_name='Settings', index=False)
+                            return True
+                        except ImportError:
+                            continue
+                    return False
+                
+                if total_data <= EXCEL_ROW_LIMIT:
+                    # Langsung tulis 1 file (kasus paling umum)
+                    out_file = os.path.join(out_dir, f"Scrape_{safe_sn}{status_label}_{ts}.xlsx")
+                    print(f"   📝 Menulis Excel ({total_data} baris)...")
+                    _write_excel(out_file, df_all_meta, df_all_pref, df_all_ans)
+                    print(f"✅ Selesai! Data disimpan di: {os.path.relpath(out_file)}")
+                else:
+                    # Split hanya jika melebihi batas baris Excel
+                    total_parts = (total_data + EXCEL_ROW_LIMIT - 1) // EXCEL_ROW_LIMIT
+                    for i in range(0, total_data, EXCEL_ROW_LIMIT):
+                        part_num = (i // EXCEL_ROW_LIMIT) + 1
+                        chunk_file = os.path.join(out_dir, f"Scrape_{safe_sn}{status_label}_{ts}_Part{part_num}.xlsx")
+                        n_rows = min(EXCEL_ROW_LIMIT, total_data - i)
+                        print(f"   📝 Menulis Part {part_num}/{total_parts} ({n_rows} baris)...")
+                        _write_excel(chunk_file,
+                                     df_all_meta.iloc[i:i+EXCEL_ROW_LIMIT],
+                                     df_all_pref.iloc[i:i+EXCEL_ROW_LIMIT] if df_all_pref is not None else None,
+                                     df_all_ans.iloc[i:i+EXCEL_ROW_LIMIT] if df_all_ans is not None else None)
+                        print(f"   ✅ Part {part_num}/{total_parts} disimpan: {os.path.relpath(chunk_file)}")
+                    print(f"✅ Selesai! {total_parts} file disimpan.")
         elif aksi == "5":
             out_dir = os.path.join(os.getcwd(), "output_scraper")
             os.makedirs(out_dir, exist_ok=True)
