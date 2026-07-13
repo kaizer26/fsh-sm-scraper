@@ -32,7 +32,6 @@ REQUIRED_PACKAGES = [
     ("urllib3",     "urllib3"),
     ("undetected-chromedriver", "undetected_chromedriver"),
     ("webdriver-manager",        "webdriver_manager"),
-    ("curl_cffi",   "curl_cffi"),
 ]
 
 def _auto_install_packages():
@@ -82,10 +81,10 @@ except ImportError:
 # KONFIGURASI
 # ====================================================================
 MAX_WORKERS_WILAYAH = 20
-MAX_WORKERS_DETAIL = 20
-REQUEST_TIMEOUT = 60
-MAX_RETRIES = 10
-MANUAL_MAX_RETRIES = 10
+MAX_WORKERS_DETAIL = 5
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 5
+MANUAL_MAX_RETRIES = 5
 BASE_URL = "https://fasih-sm.bps.go.id"
 BASE_OUTPUT_DIR = None
 
@@ -212,16 +211,8 @@ class SeleniumSession:
         return self._do_fetch('POST', url, headers, json)
 
 def create_resilient_session(driver=None, cookies=None, headers=None):
-    from curl_cffi import requests as curl_requests
-    session = curl_requests.Session(impersonate="chrome120")
-    
-    # Masukkan cookies hasil dari login browser
-    if cookies:
-        for c in cookies:
-            session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-            
-    if headers:
-        session.headers.update(headers)
+    session = SeleniumSession(driver)
+    if headers: session.headers.update(headers)
     return session
 
 # ====================================================================
@@ -748,59 +739,20 @@ def fetch_detail_task(sess, head, d, tid, pid):
     except Exception as e:
         return None
 
-import time
-import traceback
-from curl_cffi import requests
-
 def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_level=6, role="Admin", id_survey=None, user_ids=None, status_filter=None):
-    url = f"https://fasih-sm.bps.go.id/app/api/analytic/api/v2/assignment/datatable-all-user-survey-periode"
+    url = f"{BASE_URL}/analytic/api/v2/assignment/datatable-all-user-survey-periode"
     extra_param = {**filt, "surveyPeriodId": pid, "currentUserId": None}
     if status_filter:
         extra_param["assignmentStatusAlias"] = status_filter
     payload = {"draw": 1, "start": 0, "length": 1, "assignmentExtraParam": extra_param}
-    
-    current_region_name = filt.get('smallcode') or f"Level {current_level}"
-    
-    # --- MEKANISME RETRY UNTUK JAGA-JAGA ERROR 500/TIMEOUT ---
-    max_retries = 3
-    retry_delay = 5  # Jeda detik sebelum mencoba lagi
-    resp_init = None
-    
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp_init = sess.post(url, headers=head, json=payload, timeout=30)
-            resp_init.raise_for_status()
-            break  # Jika sukses (200 OK), keluar dari loop retry
-        except requests.exceptions.HTTPError as http_err:
-            status_code = resp_init.status_code if resp_init else "Unknown"
-            print(f"⚠️ [Attempt {attempt}/{max_retries}] Server return error {status_code} pada wilayah {current_region_name}.")
-            
-            if status_code == 500 and attempt < max_retries:
-                print(f"⏳ Server Fasih lelah (Error 500). Mencoba kembali dalam {retry_delay} detik...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff (5s -> 10s)
-                continue
-            else:
-                # Jika sudah max retry tapi tetap 500, kita terpaksa skip wilayah ini agar script tidak mati
-                print(f"❌ [SKIPPED] Wilayah {current_region_name} dilewati karena Server 500 berkepanjangan.")
-                return []
-        except (requests.exceptions.Timeout, Exception) as e:
-            print(f"⚠️ [Attempt {attempt}/{max_retries}] Koneksi bermasalah di {current_region_name}: {e}")
-            if attempt < max_retries:
-                time.sleep(retry_delay)
-                continue
-            return []
-
-    # --- JIKA LOLOS RETRY, PROSES SEPERTI BIASA ---
     try:
-        r = resp_init.json()
+        r = sess.post(url, headers=head, json=payload).json()
         hit = r.get('totalHit', 0)
         
         if current_level >= max_level or ("admin" in role.lower() and hit <= 1000):
-            if hit == 0: 
-                return []
+            if hit == 0: return []
             
-            # Strategi By User jika data melimpah (> 1000)
+            # Strategi By User untuk hit > 1000 (batas return API)
             if current_level >= max_level and hit > 1000 and user_ids:
                 all_collected = []
                 collected_ids = set()
@@ -814,16 +766,14 @@ def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_l
                     user_results = []
                     while True:
                         try:
-                            resp = sess.post(url, headers=head, json=p, timeout=30)
-                            resp.raise_for_status()
-                            data = resp.json().get('searchData', [])
+                            resp = sess.post(url, headers=head, json=p, timeout=20).json()
+                            data = resp.get('searchData', [])
                             user_results.extend(data)
                             if len(data) == 1000:
                                 p['start'] += 1000
                             else:
                                 break
-                        except:
-                            break
+                        except: break
                     return user_results
                 
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
@@ -835,32 +785,22 @@ def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_l
                                 collected_ids.add(item['id'])
                 return all_collected
 
-            # Ambil data langsung bulk 1000
+            # Jika tidak lebih dari 1000 atau user_ids kosong, tarik langsung
             res = []
             for s in range(0, hit, 1000):
                 payload.update({"start": s, "length": 1000})
-                try:
-                    resp_bulk = sess.post(url, headers=head, json=payload, timeout=30)
-                    resp_bulk.raise_for_status()
-                    res.extend(resp_bulk.json().get('searchData', []))
-                except Exception as b_err:
-                    print(f"⚠️ Gagal mengambil segmen data start {s} di {current_region_name}: {b_err}")
+                res.extend(sess.post(url, headers=head, json=payload).json().get('searchData', []))
             return res
             
-        # Jalur Rekursif Wilayah
         sub = _get_lvl(current_level + 1, filt.get(f'region{current_level}Id'), gid, head, sess)
         all_r = []
         for c in sub:
-            nf = filt.copy()
-            nf[f'region{current_level+1}Id'] = c['id']
-            nf['smallcode'] = c.get('fullCode')
-            if current_level <= 3: 
-                print(f"📂 Mencari di: {c['name']}...")
+            nf = filt.copy(); nf[f'region{current_level+1}Id'] = c['id']; nf['smallcode'] = c.get('fullCode')
+            if current_level <= 3: print(f"   📂 Mencari di: {c['name']}...")
             all_r.extend(fetch_assignments_dynamic(sess, head, pid, gid, nf, current_level + 1, max_level, role, id_survey, user_ids, status_filter))
         return all_r
-
     except Exception as e:
-        print(f"💥 Error tak terduga pasca-koneksi di {current_region_name}: {e}")
+        print(f"⚠️ Error fetch assignments: {e}")
         return []
 
 def approve_condition(r, s, e):
@@ -1330,9 +1270,7 @@ def main1(user, pwd, head, jar, sess, drv):
         if sess:
             try:
                 # Gunakan POST sesuai permintaan user
-                # https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType=pencacahan
-
-                r = sess.post(f"https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType=pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
+                r = sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType=Pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
                 if r.status_code == 200 and 'data' in r.json(): test_ok = True
             except: pass
 
@@ -1362,7 +1300,7 @@ def main1(user, pwd, head, jar, sess, drv):
             
             # Verifikasi apakah session dari browser ini benar-benar bisa menembus backend
             try:
-                test_r = new_sess.post(f"https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType=pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
+                test_r = new_sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType=Pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
                 if test_r.status_code != 200:
                     raise Exception(f"HTTP Status {test_r.status_code} (Harusnya 200 OK)")
                 if 'data' not in test_r.json():
@@ -1386,11 +1324,11 @@ def main1(user, pwd, head, jar, sess, drv):
     print("2. Pelatihan")
     print("3. Uji Coba")
     st_choice = input("Pilihan (1-3, default 1): ").strip()
-    stype = "pencacahan"
-    if st_choice == "2": stype = "pelatihan"
-    elif st_choice == "3": stype = "ujicoba"
+    stype = "Pencacahan"
+    if st_choice == "2": stype = "Pelatihan"
+    elif st_choice == "3": stype = "Ujicoba"
 
-    surveys = sess.post(f"https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType={stype}", json={"pageNumber":0,"pageSize":50,"sortBy":"CREATED_AT","sortDirection":"DESC"}).json()['data']['content']
+    surveys = sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType={stype}", json={"pageNumber":0,"pageSize":50,"sortBy":"CREATED_AT","sortDirection":"DESC"}).json()['data']['content']
     for i, s in enumerate(surveys): print(f"{i+1}. {s['name']}")
     sel_s = surveys[int(input("Pilih survei: "))-1]
     sid, sn = sel_s['id'], sel_s['name']
@@ -1471,10 +1409,10 @@ def main1(user, pwd, head, jar, sess, drv):
             input("\n✅ Selesai. ENTER..."); continue
         if aksi not in ["1", "2", "3", "4", "5", "7"]: continue
         
-        # Filter status assignment untuk Scrape atau Simpan Prelist
+        # Filter status assignment untuk Scrape
         status_filters = []  # List of status filters (empty = SEMUA)
         status_label = ""
-        if aksi in ["1", "7"]:
+        if aksi == "1":
             print("\n=== Filter Status Assignment (bisa pilih lebih dari 1, pisah koma) ===")
             print("0. SEMUA")
             print("1. OPEN")
@@ -1589,7 +1527,7 @@ def main1(user, pwd, head, jar, sess, drv):
                 # Pengambilan data (Drill-down vs Per Wilayah)
                 # Jika ada multi status filter, fetch per status lalu gabungkan
                 filters_to_run = status_filters if status_filters else [None]
-                print(uids)
+                
                 for sf in filters_to_run:
                     if sf:
                         print(f"\n🔍 Mencari data penugasan untuk status: {sf}...")

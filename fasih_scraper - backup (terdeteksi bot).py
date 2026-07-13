@@ -32,7 +32,6 @@ REQUIRED_PACKAGES = [
     ("urllib3",     "urllib3"),
     ("undetected-chromedriver", "undetected_chromedriver"),
     ("webdriver-manager",        "webdriver_manager"),
-    ("curl_cffi",   "curl_cffi"),
 ]
 
 def _auto_install_packages():
@@ -81,11 +80,11 @@ except ImportError:
 # ====================================================================
 # KONFIGURASI
 # ====================================================================
-MAX_WORKERS_WILAYAH = 20
+MAX_WORKERS_WILAYAH = 15
 MAX_WORKERS_DETAIL = 20
-REQUEST_TIMEOUT = 60
-MAX_RETRIES = 10
-MANUAL_MAX_RETRIES = 10
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 5
+MANUAL_MAX_RETRIES = 5
 BASE_URL = "https://fasih-sm.bps.go.id"
 BASE_OUTPUT_DIR = None
 
@@ -103,125 +102,14 @@ def pilih_folder_simpan(judul) -> str:
     BASE_OUTPUT_DIR = folder if folder else os.getcwd()
     return BASE_OUTPUT_DIR
 
-import json
-from threading import Lock
-
-class SeleniumSession:
-    def __init__(self, driver):
-        self.driver = driver
-        self.lock = Lock()
-        self.headers = {}
-        
-    def _do_fetch(self, method, url, headers=None, json_data=None):
-        import uuid, time
-        req_id = str(uuid.uuid4())
-        
-        final_headers = self.headers.copy()
-        if headers:
-            final_headers.update(headers)
-            
-        script = """
-        var method = arguments[0];
-        var url = arguments[1];
-        var headers = arguments[2];
-        var body = arguments[3];
-        var reqId = arguments[4];
-        
-        window.myFetchResults = window.myFetchResults || {};
-        
-        var options = { method: method, headers: headers };
-        if (body) {
-            options.body = JSON.stringify(body);
-            if (!options.headers['Content-Type']) {
-                options.headers['Content-Type'] = 'application/json';
-            }
-        }
-        options.credentials = 'include';
-        
-        fetch(url, options)
-            .then(r => r.text().then(text => ({status: r.status, text: text})))
-            .then(data => { window.myFetchResults[reqId] = data; })
-            .catch(err => { window.myFetchResults[reqId] = {error: err.message}; });
-        """
-        
-        # Eksekusi instan tanpa menunggu (non-blocking)
-        with self.lock:
-            self.driver.execute_script(script, method, url, final_headers, json_data, req_id)
-            
-        # Polling hasil dari background javascript
-        start_wait = time.time()
-        while True:
-            time.sleep(0.1) # Interval polling
-            with self.lock:
-                check_script = f"var res = window.myFetchResults['{req_id}']; if(res){{ delete window.myFetchResults['{req_id}']; return res; }} return null;"
-                res = self.driver.execute_script(check_script)
-                
-            if res:
-                if 'error' in res:
-                    raise Exception("Fetch failed: " + res['error'])
-                
-                class DummyResponse:
-                    def __init__(self, status, text):
-                        self.status_code = status
-                        self.text = text
-                    def json(self):
-                        try: return json.loads(self.text)
-                        except: return {}
-                
-                resp = DummyResponse(res['status'], res['text'])
-                
-                # Deteksi F5 Bot Defense (TSPD)
-                if "TSPD_" in resp.text or "Please enable JavaScript" in resp.text:
-                    print(f"\n🛡️ F5 Bot Defense terdeteksi! Browser sedang menyelesaikan tantangan otomatis...")
-                    with self.lock:
-                        current_url = self.driver.current_url
-                        # Buka URL yang diblokir agar JS F5 dieksekusi oleh Chrome
-                        self.driver.get(url)
-                        time.sleep(4)
-                        # Kembali ke halaman sebelumnya
-                        self.driver.get(current_url)
-                        time.sleep(2)
-                    raise Exception("F5 Challenge ditangani, mencoba ulang...")
-                
-                if resp.status_code == 401 or resp.status_code == 403: pass
-                return resp
-                
-            if time.time() - start_wait > REQUEST_TIMEOUT:
-                raise Exception("Fetch timeout in Chrome!")
-        
-    def get(self, url, headers=None, timeout=None):
-        import time
-        for _ in range(MAX_RETRIES):
-            try:
-                resp = self._do_fetch('GET', url, headers)
-                if resp.status_code not in [500, 502, 503, 504, 429]:
-                    return resp
-            except Exception: pass
-            time.sleep(1)
-        return self._do_fetch('GET', url, headers)
-        
-    def post(self, url, headers=None, json=None, timeout=None):
-        import time
-        for _ in range(MAX_RETRIES):
-            try:
-                resp = self._do_fetch('POST', url, headers, json)
-                if resp.status_code not in [500, 502, 503, 504, 429]:
-                    return resp
-            except Exception: pass
-            time.sleep(1)
-        return self._do_fetch('POST', url, headers, json)
-
-def create_resilient_session(driver=None, cookies=None, headers=None):
-    from curl_cffi import requests as curl_requests
-    session = curl_requests.Session(impersonate="chrome120")
-    
-    # Masukkan cookies hasil dari login browser
-    if cookies:
-        for c in cookies:
-            session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-            
-    if headers:
-        session.headers.update(headers)
+def create_resilient_session(cookies=None, headers=None) -> requests.Session:
+    session = requests.Session()
+    retry_strategy = Retry(total=MAX_RETRIES, backoff_factor=1.0, backoff_max=60, 
+                            status_forcelist=[500, 502, 503, 504, 429], allowed_methods=["GET", "POST"], raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
+    session.mount("https://", adapter); session.mount("http://", adapter)
+    if cookies: session.cookies = cookies
+    if headers: session.headers.update(headers)
     return session
 
 # ====================================================================
@@ -249,7 +137,7 @@ def simpan_session(user, head, cook, sess, pwd, ls=None, ss=None):
             'ls': ls, 'ss': ss, 'time': time.time()
         }, f)
 
-def muat_session(user, driver=None):
+def muat_session(user):
     s_dir = os.path.join(pilih_folder_simpan("Pilih Folder Session"), "sessions")
     f_path = os.path.join(s_dir, f"{user}_session.pkl")
     if os.path.exists(f_path):
@@ -263,107 +151,49 @@ def muat_session(user, driver=None):
                         # print(f"Password= {_deobf(d['pwd'])}")
                         # print(f"Password= {d['pwd']}")
                         return None, None, None, _deobf(d['pwd']), None, None
-                    return d['head'], d['cook'], create_resilient_session(driver=driver, headers=d['head']), _deobf(d['pwd']), d.get('ls'), d.get('ss')
+                    return d['head'], d['cook'], create_resilient_session(d['cook'], d['head']), _deobf(d['pwd']), d.get('ls'), d.get('ss')
         except:
             pass
     return None, None, None, None, None, None
 
-def get_chrome_profiles():
-    chrome_data_dir = os.path.expandvars(r'%LOCALAPPDATA%\Google\Chrome\User Data')
-    local_state_path = os.path.join(chrome_data_dir, 'Local State')
-    profiles = []
-    
-    if os.path.exists(local_state_path):
-        try:
-            import json
-            with open(local_state_path, 'r', encoding='utf-8') as f:
-                state = json.load(f)
-            
-            profile_info = state.get('profile', {}).get('info_cache', {})
-            for folder_name, info in profile_info.items():
-                name = info.get('name', folder_name)
-                profiles.append((folder_name, name))
-        except:
-            pass
-            
-    if not profiles and os.path.exists(chrome_data_dir):
-        for f in os.listdir(chrome_data_dir):
-            if f == 'Default' or f.startswith('Profile '):
-                profiles.append((f, f))
-                
-    return chrome_data_dir, profiles
-
 def setup_driver():
     opts = uc.ChromeOptions() if uc else Options()
-    
-    chrome_data_dir, profiles = get_chrome_profiles()
-    if profiles:
-        print("\n" + "="*50)
-        print("🖥️  PROFIL CHROME TERDETEKSI")
-        print("="*50)
-        for i, (folder, name) in enumerate(profiles, 1):
-            print(f"{i}. {name} ({folder})")
-        print(f"{len(profiles)+1}. Gunakan Profil Baru (Tanpa riwayat/polos)")
-        print("="*50)
-        
-        while True:
-            try:
-                pilihan = input("Pilih nomor profil yang ingin digunakan: ")
-                if not pilihan.strip(): continue
-                pilihan = int(pilihan)
-                if 1 <= pilihan <= len(profiles):
-                    folder_name = profiles[pilihan-1][0]
-                    opts.add_argument(f"--user-data-dir={chrome_data_dir}")
-                    opts.add_argument(f"--profile-directory={folder_name}")
-                    print(f"✅ Menggunakan profil: {profiles[pilihan-1][1]} (Incognito)")
-                    break
-                elif pilihan == len(profiles) + 1:
-                    print("✅ Menggunakan profil baru/polos (Incognito).")
-                    break
-                else:
-                    print("⚠️ Pilihan tidak valid.")
-            except ValueError:
-                print("⚠️ Masukkan angka yang valid.")
-    else:
-        print("⚠️ Tidak ada profil Chrome yang terdeteksi. Menggunakan profil baru.")
-
     opts.add_argument("--incognito")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--log-level=3")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--disable-features=CalculateNativeWinOcclusion")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--remote-debugging-port=0")
-    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36 Edg/101.0.1210.47")
     
     # Deteksi versi Chrome untuk UC
     chrome_version = None
     if uc:
         try:
             import subprocess
-            import platform
             if platform.system() == 'Windows':
                 cmd = 'reg query "HKEY_CURRENT_USER\\Software\\Google\\Chrome\\BLBeacon" /v version'
                 output = subprocess.check_output(cmd, shell=True).decode()
                 chrome_version = int(output.strip().split()[-1].split('.')[0])
+            print(f"🔍 Terdeteksi Chrome Versi: {chrome_version}")
         except: pass
 
-    try:
-        if uc:
-            print("🌐 Membuka browser (Undetected Mode)...")
+    if uc:
+        try:
+            print("🌐 Mencoba membuka browser (Undetected Mode)...")
             driver = uc.Chrome(options=opts, headless=False, use_subprocess=True, version_main=chrome_version)
-        else:
-            print("🌐 Membuka browser standar dengan profil pilihan...")
-            if ChromeDriverManager:
-                service = Service(ChromeDriverManager().install())
-            else:
-                service = Service()
-            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-            opts.add_experimental_option('useAutomationExtension', False)
-            driver = webdriver.Chrome(service=service, options=opts)
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"})
-            
+            return driver
+        except Exception as e:
+            print(f"⚠️ Undetected-Chromedriver gagal: {e}")
+            print("🔄 Mencoba metode cadangan (Selenium Standar + Manager)...")
+
+    try:
+        if ChromeDriverManager:
+            print("🛠️ Mengunduh driver yang sesuai...")
+            service = Service(ChromeDriverManager().install())
+        else:
+            service = Service()
+        
+        driver = webdriver.Chrome(service=service, options=opts)
         return driver
     except Exception as e:
         clear_screen()
@@ -373,9 +203,9 @@ def setup_driver():
         print(f"Detail Error: {e}")
         print("-" * 50)
         print("SARAN SOLUSI:")
-        print("1. TUTUP SEMUA JENDELA GOOGLE CHROME YANG SEDANG TERBUKA. Selenium tidak bisa meminjam profil jika browser asli sedang terbuka.")
-        print("2. Jika Anda masih butuh browsing, jalankan script ini dulu, baru buka Chrome biasa setelahnya.")
-        print("3. Coba pilih profil lain atau 'Gunakan Profil Baru' jika masalah berlanjut.")
+        print("1. Update Google Chrome Anda (Settings > About Chrome).")
+        print("2. Jika error 'version mismatch', hapus folder %LOCALAPPDATA%\\undetected_chromedriver.")
+        print("3. Pastikan tidak ada Chrome yang sedang terbuka secara abnormal.")
         print("="*50)
         input("\nTekan ENTER untuk keluar...")
         sys.exit(1)
@@ -394,12 +224,12 @@ def ambil_cookies_dan_buat_session(driver, pwd):
     for c in selenium_cookies:
         jar.set(c['name'], c['value'], domain=c.get('domain'), path=c.get('path', '/'))
         if c['name'] == 'XSRF-TOKEN': xsrf = urllib.parse.unquote(c['value'])
-    real_user_agent = driver.execute_script("return navigator.userAgent;")
     head = {
         'X-Requested-With': 'XMLHttpRequest', 'X-XSRF-TOKEN': xsrf, 'Referer': BASE_URL + '/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*', 'Connection': 'keep-alive'
     }
-    return head, jar, create_resilient_session(driver, jar, head), pwd, ls, ss
+    return head, jar, create_resilient_session(jar, head), pwd, ls, ss
 
 def suntik_cookies_ke_driver(driver, jar, ls=None, ss=None):
     print("💉 Menyuntikkan session ke browser...")
@@ -703,7 +533,9 @@ def ekstrak_fullcode_terdalam(data):
 
 def fetch_detail_task(sess, head, d, tid, pid):
     aid = d.get('id') or d.get('assignmentId')
+    # url = f"{BASE_URL}/assignment-general/api/assignment/get-by-id-with-data-for-scm?id={aid}"
     url = f"https://fasih-sm.bps.go.id/app/api/assignment-general/api/assignment/get-by-assignment-id?assignmentId={aid}"
+    
     
     try:
         res = sess.get(url, headers=head, timeout=REQUEST_TIMEOUT).json().get('data', {})
@@ -748,59 +580,20 @@ def fetch_detail_task(sess, head, d, tid, pid):
     except Exception as e:
         return None
 
-import time
-import traceback
-from curl_cffi import requests
-
 def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_level=6, role="Admin", id_survey=None, user_ids=None, status_filter=None):
-    url = f"https://fasih-sm.bps.go.id/app/api/analytic/api/v2/assignment/datatable-all-user-survey-periode"
+    url = f"{BASE_URL}/analytic/api/v2/assignment/datatable-all-user-survey-periode"
     extra_param = {**filt, "surveyPeriodId": pid, "currentUserId": None}
     if status_filter:
         extra_param["assignmentStatusAlias"] = status_filter
     payload = {"draw": 1, "start": 0, "length": 1, "assignmentExtraParam": extra_param}
-    
-    current_region_name = filt.get('smallcode') or f"Level {current_level}"
-    
-    # --- MEKANISME RETRY UNTUK JAGA-JAGA ERROR 500/TIMEOUT ---
-    max_retries = 3
-    retry_delay = 5  # Jeda detik sebelum mencoba lagi
-    resp_init = None
-    
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp_init = sess.post(url, headers=head, json=payload, timeout=30)
-            resp_init.raise_for_status()
-            break  # Jika sukses (200 OK), keluar dari loop retry
-        except requests.exceptions.HTTPError as http_err:
-            status_code = resp_init.status_code if resp_init else "Unknown"
-            print(f"⚠️ [Attempt {attempt}/{max_retries}] Server return error {status_code} pada wilayah {current_region_name}.")
-            
-            if status_code == 500 and attempt < max_retries:
-                print(f"⏳ Server Fasih lelah (Error 500). Mencoba kembali dalam {retry_delay} detik...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff (5s -> 10s)
-                continue
-            else:
-                # Jika sudah max retry tapi tetap 500, kita terpaksa skip wilayah ini agar script tidak mati
-                print(f"❌ [SKIPPED] Wilayah {current_region_name} dilewati karena Server 500 berkepanjangan.")
-                return []
-        except (requests.exceptions.Timeout, Exception) as e:
-            print(f"⚠️ [Attempt {attempt}/{max_retries}] Koneksi bermasalah di {current_region_name}: {e}")
-            if attempt < max_retries:
-                time.sleep(retry_delay)
-                continue
-            return []
-
-    # --- JIKA LOLOS RETRY, PROSES SEPERTI BIASA ---
     try:
-        r = resp_init.json()
+        r = sess.post(url, headers=head, json=payload).json()
         hit = r.get('totalHit', 0)
         
         if current_level >= max_level or ("admin" in role.lower() and hit <= 1000):
-            if hit == 0: 
-                return []
+            if hit == 0: return []
             
-            # Strategi By User jika data melimpah (> 1000)
+            # Strategi By User untuk hit > 1000 (batas return API)
             if current_level >= max_level and hit > 1000 and user_ids:
                 all_collected = []
                 collected_ids = set()
@@ -814,16 +607,14 @@ def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_l
                     user_results = []
                     while True:
                         try:
-                            resp = sess.post(url, headers=head, json=p, timeout=30)
-                            resp.raise_for_status()
-                            data = resp.json().get('searchData', [])
+                            resp = sess.post(url, headers=head, json=p, timeout=20).json()
+                            data = resp.get('searchData', [])
                             user_results.extend(data)
                             if len(data) == 1000:
                                 p['start'] += 1000
                             else:
                                 break
-                        except:
-                            break
+                        except: break
                     return user_results
                 
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS_WILAYAH) as ex:
@@ -835,32 +626,22 @@ def fetch_assignments_dynamic(sess, head, pid, gid, filt, current_level=2, max_l
                                 collected_ids.add(item['id'])
                 return all_collected
 
-            # Ambil data langsung bulk 1000
+            # Jika tidak lebih dari 1000 atau user_ids kosong, tarik langsung
             res = []
             for s in range(0, hit, 1000):
                 payload.update({"start": s, "length": 1000})
-                try:
-                    resp_bulk = sess.post(url, headers=head, json=payload, timeout=30)
-                    resp_bulk.raise_for_status()
-                    res.extend(resp_bulk.json().get('searchData', []))
-                except Exception as b_err:
-                    print(f"⚠️ Gagal mengambil segmen data start {s} di {current_region_name}: {b_err}")
+                res.extend(sess.post(url, headers=head, json=payload).json().get('searchData', []))
             return res
             
-        # Jalur Rekursif Wilayah
         sub = _get_lvl(current_level + 1, filt.get(f'region{current_level}Id'), gid, head, sess)
         all_r = []
         for c in sub:
-            nf = filt.copy()
-            nf[f'region{current_level+1}Id'] = c['id']
-            nf['smallcode'] = c.get('fullCode')
-            if current_level <= 3: 
-                print(f"📂 Mencari di: {c['name']}...")
+            nf = filt.copy(); nf[f'region{current_level+1}Id'] = c['id']; nf['smallcode'] = c.get('fullCode')
+            if current_level <= 3: print(f"   📂 Mencari di: {c['name']}...")
             all_r.extend(fetch_assignments_dynamic(sess, head, pid, gid, nf, current_level + 1, max_level, role, id_survey, user_ids, status_filter))
         return all_r
-
     except Exception as e:
-        print(f"💥 Error tak terduga pasca-koneksi di {current_region_name}: {e}")
+        print(f"⚠️ Error fetch assignments: {e}")
         return []
 
 def approve_condition(r, s, e):
@@ -929,7 +710,8 @@ def process_assignments_generic(sid, tid, pid, kn, sn, alist, head, jar, sess, d
         # Ambil detail untuk cek status_keberadaan (seperti v8/v9)
         extra = {}
         try:
-            d_url = f"{BASE_URL}/assignment-general/api/assignment/get-by-id-with-data-for-scm?id={aid}"
+            # d_url = f"{BASE_URL}/assignment-general/api/assignment/get-by-id-with-data-for-scm?id={aid}"
+            d_url = f"https://fasih-sm.bps.go.id/app/api/assignment-general/api/assignment/get-by-assignment-id?assignmentId={aid}"
             res_d = sess.get(d_url, headers=head, timeout=10).json().get('data', {})
             extra['status_keberadaan'] = res_d.get('data6') # data6 biasanya status keberadaan
             if st == 'N/A' or not st:
@@ -1330,9 +1112,7 @@ def main1(user, pwd, head, jar, sess, drv):
         if sess:
             try:
                 # Gunakan POST sesuai permintaan user
-                # https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType=pencacahan
-
-                r = sess.post(f"https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType=pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
+                r = sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType=Pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
                 if r.status_code == 200 and 'data' in r.json(): test_ok = True
             except: pass
 
@@ -1362,7 +1142,7 @@ def main1(user, pwd, head, jar, sess, drv):
             
             # Verifikasi apakah session dari browser ini benar-benar bisa menembus backend
             try:
-                test_r = new_sess.post(f"https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType=pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
+                test_r = new_sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType=Pencacahan", json={"pageNumber":0,"pageSize":100,"sortBy":"CREATED_AT","sortDirection":"DESC"}, timeout=10)
                 if test_r.status_code != 200:
                     raise Exception(f"HTTP Status {test_r.status_code} (Harusnya 200 OK)")
                 if 'data' not in test_r.json():
@@ -1386,11 +1166,11 @@ def main1(user, pwd, head, jar, sess, drv):
     print("2. Pelatihan")
     print("3. Uji Coba")
     st_choice = input("Pilihan (1-3, default 1): ").strip()
-    stype = "pencacahan"
-    if st_choice == "2": stype = "pelatihan"
-    elif st_choice == "3": stype = "ujicoba"
+    stype = "Pencacahan"
+    if st_choice == "2": stype = "Pelatihan"
+    elif st_choice == "3": stype = "Ujicoba"
 
-    surveys = sess.post(f"https://fasih-sm.bps.go.id/app/api/survey/api/v1/surveys/datatable?surveyType={stype}", json={"pageNumber":0,"pageSize":50,"sortBy":"CREATED_AT","sortDirection":"DESC"}).json()['data']['content']
+    surveys = sess.post(f"{BASE_URL}/survey/api/v1/surveys/datatable?surveyType={stype}", json={"pageNumber":0,"pageSize":50,"sortBy":"CREATED_AT","sortDirection":"DESC"}).json()['data']['content']
     for i, s in enumerate(surveys): print(f"{i+1}. {s['name']}")
     sel_s = surveys[int(input("Pilih survei: "))-1]
     sid, sn = sel_s['id'], sel_s['name']
@@ -1471,10 +1251,10 @@ def main1(user, pwd, head, jar, sess, drv):
             input("\n✅ Selesai. ENTER..."); continue
         if aksi not in ["1", "2", "3", "4", "5", "7"]: continue
         
-        # Filter status assignment untuk Scrape atau Simpan Prelist
+        # Filter status assignment untuk Scrape
         status_filters = []  # List of status filters (empty = SEMUA)
         status_label = ""
-        if aksi in ["1", "7"]:
+        if aksi == "1":
             print("\n=== Filter Status Assignment (bisa pilih lebih dari 1, pisah koma) ===")
             print("0. SEMUA")
             print("1. OPEN")
@@ -1571,7 +1351,7 @@ def main1(user, pwd, head, jar, sess, drv):
                                 x = {
                                     'id': aid,
                                     'assignmentId': aid,
-                                    # 'assignmentStatusAlias': 'N/A',
+                                    'assignmentStatusAlias': 'N/A',
                                     **item
                                 }
                                 unique.append(x)
@@ -1589,7 +1369,7 @@ def main1(user, pwd, head, jar, sess, drv):
                 # Pengambilan data (Drill-down vs Per Wilayah)
                 # Jika ada multi status filter, fetch per status lalu gabungkan
                 filters_to_run = status_filters if status_filters else [None]
-                print(uids)
+                
                 for sf in filters_to_run:
                     if sf:
                         print(f"\n🔍 Mencari data penugasan untuk status: {sf}...")
@@ -1703,47 +1483,15 @@ def main1(user, pwd, head, jar, sess, drv):
                     except: pass
                 return res
 
-            while to_scrape:
-                success_cnt = 0
-                fail_cnt = 0
-                last_err = ""
-                failed_items = []
+            if to_scrape:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS_DETAIL) as ex:
                     fs = {ex.submit(fetch_and_save_checkpoint, sess, head, d, tid, pid, chk_dir): d for d in to_scrape}
-                    pbar = tqdm(as_completed(fs), total=len(fs), desc="📥 Scraping Detail", unit="data")
-                    for f in pbar:
-                        d = fs[f]
+                    for f in tqdm(as_completed(fs), total=len(fs), desc="📥 Scraping Detail", unit="data"):
                         res = f.result()
                         if res:
                             all_meta.append(res['meta'])
                             all_pref.append(res['pref'])
                             all_ans.append(res['ans'])
-                            success_cnt += 1
-                        else:
-                            fail_cnt += 1
-                            aid = str(d.get('id') or d.get('assignmentId'))
-                            last_err = f"[{aid}] Gagal scrape"
-                            failed_items.append(d)
-                        
-                        # Tampilkan error terakhir di indikator bar
-                        if last_err:
-                            pbar.set_postfix(Berhasil=success_cnt, Gagal=fail_cnt, Err=last_err)
-                        else:
-                            pbar.set_postfix(Berhasil=success_cnt, Gagal=fail_cnt)
-
-                if failed_items:
-                    print(f"\n⚠️ Terdapat {len(failed_items)} data yang gagal di-scrape.")
-                    print("Contoh ID yang gagal: " + ", ".join([str(item.get('id') or item.get('assignmentId')) for item in failed_items[:5]]))
-                    retry = input("Ingin mengulangi scrape untuk data yang gagal? (Y/N, default Y): ").strip().upper()
-                    if retry != 'N':
-                        to_scrape = failed_items
-                        print("⏳ Mengulangi scrape untuk data yang gagal...")
-                        continue
-                    else:
-                        print("⏭️ Melanjutkan tanpa data yang gagal.")
-                        break
-                else:
-                    break
             
             # Hapus checkpoint jika berhasil mengunduh semua data
             if len(all_meta) >= len(unique) and len(unique) > 0:
@@ -1991,34 +1739,17 @@ def main1(user, pwd, head, jar, sess, drv):
 
 if __name__ == "__main__":
     drv = setup_driver(); clear_screen()
-    print("="*50)
-    print("🌐 BROWSER TELAH TERBUKA!")
-    print("="*50)
-    print("PILIHAN LOGIN:")
-    print("1. Login Otomatis oleh Script (Ketik Username Anda di bawah)")
-    print("2. Login Manual di Browser (Kosongkan isian di bawah & langsung tekan ENTER)")
-    print("="*50)
+    user = input("Username SSO: ")
+    h, c, s, p, ls, ss = muat_session(user)
     
-    user = input("Username SSO (Kosongkan jika login manual): ").strip()
+    success = False
+    if s:
+        success = suntik_cookies_ke_driver(drv, c, ls, ss)
     
-    if user:
-        h, c, s, p, ls, ss = muat_session(user, driver=drv)
-        success = False
-        if s:
-            success = suntik_cookies_ke_driver(drv, c, ls, ss)
-        
-        if not success:
-            print("🔄 Melakukan login ulang untuk mendapatkan session baru...")
-            h, c, s, p, ls, ss = main_login(drv, user, pwd=p)
-            simpan_session(user, h, c, s, p, ls, ss)
-    else:
-        user = "manual_user"
-        p = "manual_pwd"
-        print("\n⏳ Silakan buka browser yang baru saja muncul dan lakukan login secara manual.")
-        drv.get(BASE_URL + "/")
-        input("👉 JIKA SUDAH BERHASIL MASUK KE DASHBOARD FASIH, TEKAN ENTER DI SINI UNTUK MELANJUTKAN...")
-        h, c, s, p, ls, ss = ambil_cookies_dan_buat_session(drv, p)
-        # Tidak perlu simpan session permanen jika manual, atau simpan sementara
+    if not success:
+        print("🔄 Melakukan login ulang untuk mendapatkan session baru...")
+        # print(f"Password= {p}")
+        h, c, s, p, ls, ss = main_login(drv, user, pwd=p)
         simpan_session(user, h, c, s, p, ls, ss)
 
     while True:
